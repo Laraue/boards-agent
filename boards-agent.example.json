@@ -3,11 +3,12 @@
   "mcpUrl": "http://localhost:5202/mcp",
   // The environment variable that holds your Boards API key (Account -> API keys). Never put the key here.
   "apiKeyEnv": "BOARDS_AGENT_API_KEY",
-  // Space key -> local checkout of that space's repository. Only these spaces are polled.
+  // Space key -> the local repository its issues are worked on in. Only these spaces are polled.
+  // Each issue gets a worktree on branch agent/<KEY>, started from baseRef (default HEAD); the checkout itself isn't touched.
   "spaces": {
-    "BRD": "~/Repos/my-project"
+    "BRD": { "repo": "~/Repos/my-project", "baseRef": "origin/main" }
   },
-  // One git worktree per issue is created here, on branch agent/<KEY>.
+  // Where the worktrees go: <worktreeFolder>/<KEY>.
   "worktreeFolder": "~/boards-agent-worktrees",
   "claudePath": "claude",
   "maxTurns": 50,
