@@ -1,0 +1,17 @@
+{
+  // The Boards MCP endpoint. Production: https://boards.laraue.com/mcp
+  "mcpUrl": "http://localhost:5202/mcp",
+  // The environment variable that holds your Boards API key (Account -> API keys). Never put the key here.
+  "apiKeyEnv": "BOARDS_AGENT_API_KEY",
+  // Space key -> local checkout of that space's repository. Only these spaces are polled.
+  "spaces": {
+    "BRD": "~/Repos/my-project"
+  },
+  // One git worktree per issue is created here, on branch agent/<KEY>.
+  "worktreeFolder": "~/boards-agent-worktrees",
+  "claudePath": "claude",
+  "maxTurns": 50,
+  "maxBudgetUsd": 5,
+  "timeoutMinutes": 60,
+  "pollIntervalSeconds": 60
+}
