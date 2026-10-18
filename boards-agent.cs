@@ -30,7 +30,7 @@ await using var boards = await BoardsClient.ConnectAsync(config.McpUrl, apiKey, 
 
 var me = await boards.GetMe(stop.Token);
 Log.Info($"Connected to {config.McpUrl} as {me.User.DisplayName} ({me.User.Id}), organization {me.Organization.Name}.");
-Log.Info($"Watching spaces: {string.Join(", ", config.Spaces.Keys)}.{(options.DryRun ? " Dry run - nothing is claimed." : "")}");
+Log.Info($"Watching spaces: {string.Join(", ", config.Spaces.Keys)}.{(options.DryRun ? " Dry run - nothing is claimed." : $" Claude Code: {ClaudeExecutable.Resolve(config.ClaudePath)}")}");
 
 var runner = new Runner(boards, config, me.User.Id);
 try
@@ -91,12 +91,13 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, Guid userId)
         }
 
         Log.Info($"{run.IssueKey}: claimed run {run.Id}.");
+        Worktree worktree;
         try
         {
             var statuses = await FindEpicStatuses(spaceKey, run.IssueKey, ct);
             var inProgress = statuses.Statuses.First(x => x.CategoryId == StatusCategories.InProgress);
 
-            var worktree = Git.CreateWorktree(space.Repo, space.BaseRef, config.WorktreeFolder, run.IssueKey);
+            worktree = Git.CreateWorktree(space.Repo, space.BaseRef, config.WorktreeFolder, run.IssueKey);
             Log.Info($"{run.IssueKey}: worktree {worktree.Path} on branch {worktree.Branch}.");
 
             await boards.EditIssueStatus(
@@ -105,17 +106,79 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, Guid userId)
                 $"boards-agent picked this up on {Environment.MachineName}, branch `{worktree.Branch}`.",
                 ct);
             Log.Info($"{run.IssueKey}: moved to {inProgress.Name} ({statuses.EpicName}).");
-
-            // Step 2: the Claude Code part isn't wired yet.
-            await Fail(run, "boards-agent: the work step isn't implemented yet (runner step 2 test).", ct);
         }
         catch (Exception e) when (e is not OperationCanceledException)
         {
             Log.Error($"{run.IssueKey}: {e.Message}");
-            await Fail(run, $"boards-agent couldn't start: {e.Message}", ct);
+            await Fail(run, $"boards-agent couldn't start: {e.Message}");
+            return true;
         }
 
+        await Work(run, worktree, ct);
         return true;
+    }
+
+    /// <summary>
+    /// Runs Claude Code in the worktree until it exits, the run is cancelled, or the timeout passes. The agent
+    /// reports and finishes the run itself; the runner only finishes it when the agent couldn't.
+    /// </summary>
+    private async Task Work(AgentRunSummary run, Worktree worktree, CancellationToken ct)
+    {
+        var logPath = Path.Combine(config.WorktreeFolder, $"{run.IssueKey}.run-{run.Id}.jsonl");
+        using var agent = ClaudeAgent.Start(config, run, worktree, logPath);
+        Log.Info($"{run.IssueKey}: Claude Code started (pid {agent.ProcessId}), log {logPath}.");
+
+        var deadline = DateTime.UtcNow.AddMinutes(config.TimeoutMinutes);
+        while (true)
+        {
+            Task tick = Task.Delay(TimeSpan.FromSeconds(config.CancelCheckSeconds), CancellationToken.None);
+            Task exited = agent.WaitForExitAsync();
+            var stopped = Task.Delay(Timeout.Infinite, ct);
+            var first = await Task.WhenAny(exited, tick, stopped);
+
+            if (first == exited)
+            {
+                break;
+            }
+
+            if (first == stopped)
+            {
+                agent.Kill();
+                Log.Info($"{run.IssueKey}: the runner was stopped - Claude Code killed.");
+                await Fail(run, "boards-agent was stopped on the developer's machine before the work was finished.");
+                return;
+            }
+
+            if (DateTime.UtcNow >= deadline)
+            {
+                agent.Kill();
+                Log.Info($"{run.IssueKey}: timed out after {config.TimeoutMinutes} min - Claude Code killed.");
+                await Fail(run, $"boards-agent stopped Claude Code: no result after {config.TimeoutMinutes} minutes. {agent.Summary()}");
+                return;
+            }
+
+            var state = await GetRunState(run, ct);
+            if (state == AgentRunStates.Cancelled)
+            {
+                agent.Kill();
+                Log.Info($"{run.IssueKey}: run {run.Id} was cancelled - Claude Code killed.");
+                return;
+            }
+        }
+
+        var finalState = await GetRunState(run, CancellationToken.None);
+        Log.Info($"{run.IssueKey}: Claude Code exited ({agent.ExitCode}), run {run.Id} is {finalState}. {agent.Summary()}");
+        if (finalState == AgentRunStates.Working)
+        {
+            await Fail(run, $"Claude Code stopped without finishing the run (exit code {agent.ExitCode}). {agent.Summary()}");
+        }
+    }
+
+    /// <summary>The run's state now, or null when it isn't the issue's latest run anymore.</summary>
+    private async Task<string?> GetRunState(AgentRunSummary run, CancellationToken ct)
+    {
+        var issue = await boards.GetIssue(run.IssueKey, ct);
+        return issue.LatestAgentRun?.Id == run.Id ? issue.LatestAgentRun.State : null;
     }
 
     /// <summary>
@@ -136,8 +199,11 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, Guid userId)
         throw new InvalidOperationException($"couldn't find the epic of {issueKey} in {spaceKey}");
     }
 
-    /// <summary>Records why the run failed, as a comment people see and on the run itself.</summary>
-    private async Task Fail(AgentRunSummary run, string reason, CancellationToken ct)
+    /// <summary>
+    /// Records why the run failed, as a comment people see and on the run itself. Not cancellable: a run left
+    /// Working would keep the issue locked.
+    /// </summary>
+    private async Task Fail(AgentRunSummary run, string reason)
     {
         if (reason.Length > MaxReasonLength)
         {
@@ -146,8 +212,8 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, Guid userId)
 
         try
         {
-            await boards.CreateComment(run.IssueKey, reason, ct);
-            if (await boards.FinishAgentRun(run.Id, "Failed", reason, ct))
+            await boards.CreateComment(run.IssueKey, reason, CancellationToken.None);
+            if (await boards.FinishAgentRun(run.Id, AgentRunStates.Failed, reason, CancellationToken.None))
             {
                 Log.Info($"{run.IssueKey}: run {run.Id} finished as Failed.");
             }
@@ -156,11 +222,19 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, Guid userId)
                 Log.Info($"{run.IssueKey}: run {run.Id} was cancelled meanwhile.");
             }
         }
-        catch (Exception e) when (e is not OperationCanceledException)
+        catch (Exception e)
         {
             Log.Error($"{run.IssueKey}: couldn't report the failure: {e.Message}");
         }
     }
+}
+
+/// <summary>Agent run states, as the MCP tools name them.</summary>
+static class AgentRunStates
+{
+    public const string Working = "Working";
+    public const string Failed = "Failed";
+    public const string Cancelled = "Cancelled";
 }
 
 /// <summary>Status category ids, as list_statuses returns them.</summary>
@@ -177,6 +251,232 @@ static class StatusCategories
         return statuses.Any(x => x.CategoryId == Created)
             && statuses.Any(x => x.CategoryId == InProgress)
             && statuses.Any(x => x.CategoryId == Review);
+    }
+}
+
+/// <summary>A Claude Code process working on one run, in print mode, its stream-json output going to a log file.</summary>
+sealed class ClaudeAgent : IDisposable
+{
+    /// <summary>The Boards MCP tools the agent may call. Not edit_issue/delete_issue (locked anyway) or the run tools other than finish.</summary>
+    private static readonly string[] BoardsTools =
+    [
+        "get_me",
+        "get_issue",
+        "list_issue_comments",
+        "get_issue_history",
+        "get_attachment",
+        "list_issues",
+        "list_statuses",
+        "list_epics",
+        "list_members",
+        "edit_issue_status",
+        "create_comment",
+        "finish_agent_run",
+    ];
+
+    /// <summary>Never allowed, whatever the repository's own settings say.</summary>
+    private static readonly string[] DisallowedTools =
+    [
+        "Bash(git push:*)",
+        "Bash(gh:*)",
+        "WebFetch",
+        "WebSearch",
+    ];
+
+    private readonly System.Diagnostics.Process _process;
+    private readonly StreamWriter _log;
+    private readonly Task _pump;
+    private string? _resultLine;
+
+    private ClaudeAgent(System.Diagnostics.Process process, StreamWriter log)
+    {
+        _process = process;
+        _log = log;
+        _pump = Task.Run(Pump);
+    }
+
+    public int ProcessId => _process.Id;
+
+    public int ExitCode => _process.ExitCode;
+
+    public static ClaudeAgent Start(RunnerConfig config, AgentRunSummary run, Worktree worktree, string logPath)
+    {
+        var mcpConfigPath = Path.Combine(config.WorktreeFolder, $"{run.IssueKey}.mcp.json");
+        File.WriteAllText(mcpConfigPath, McpConfig(config));
+
+        var info = new System.Diagnostics.ProcessStartInfo(ClaudeExecutable.Resolve(config.ClaudePath))
+        {
+            WorkingDirectory = worktree.Path,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+        string[] arguments =
+        [
+            "-p", Prompt(run, worktree),
+            "--output-format", "stream-json",
+            "--verbose",
+            "--permission-mode", "acceptEdits",
+            "--max-turns", config.MaxTurns.ToString(),
+            "--mcp-config", mcpConfigPath,
+            "--strict-mcp-config",
+            "--setting-sources", "project",
+            "--allowedTools", .. config.AllowedTools, .. BoardsTools.Select(x => $"mcp__boards__{x}"),
+            "--disallowedTools", .. DisallowedTools,
+        ];
+        foreach (var argument in arguments)
+        {
+            info.ArgumentList.Add(argument);
+        }
+
+        if (config.MaxBudgetUsd is { } budget)
+        {
+            info.ArgumentList.Add("--max-budget-usd");
+            info.ArgumentList.Add(budget.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        }
+
+        // A runner started from inside a Claude Code session must not hand that session's state to the agent.
+        foreach (var name in info.Environment.Keys.Where(x => x == "CLAUDECODE" || x.StartsWith("CLAUDE_CODE_") || x.StartsWith("CLAUDE_AGENT_SDK_")).ToList())
+        {
+            info.Environment.Remove(name);
+        }
+
+        var process = System.Diagnostics.Process.Start(info)!;
+        process.StandardInput.Close();
+        return new ClaudeAgent(process, new StreamWriter(logPath, append: true) { AutoFlush = true });
+    }
+
+    /// <summary>The boards MCP server for the agent. The API key stays in the environment: Claude Code expands ${VAR}.</summary>
+    private static string McpConfig(RunnerConfig config)
+    {
+        var server = new Dictionary<string, object>
+        {
+            ["type"] = "http",
+            ["url"] = config.McpUrl,
+            ["headers"] = new Dictionary<string, string> { ["X-Api-Key"] = $"${{{config.ApiKeyEnv}}}" },
+        };
+        return JsonSerializer.Serialize(new Dictionary<string, object> { ["mcpServers"] = new Dictionary<string, object> { ["boards"] = server } });
+    }
+
+    private static string Prompt(AgentRunSummary run, Worktree worktree)
+    {
+        return $"""
+            You are working on Laraue Boards issue {run.IssueKey} ("{run.IssueTitle}"), agent run {run.Id}.
+            You are in a git worktree on branch {worktree.Branch}. Read the issue with the boards get_issue tool, do the
+            work it describes here, and commit it on this branch. Never push.
+            When you're done, post a short summary with create_comment and call finish_agent_run({run.Id}, "Done").
+            If you can't do it, call finish_agent_run({run.Id}, "Failed", <why>).
+            """;
+    }
+
+    public Task WaitForExitAsync()
+    {
+        return Task.WhenAll(_process.WaitForExitAsync(), _pump);
+    }
+
+    public void Kill()
+    {
+        if (!_process.HasExited)
+        {
+            _process.Kill(entireProcessTree: true);
+        }
+
+        _process.WaitForExit();
+    }
+
+    /// <summary>What Claude Code's final result says: how it ended, turns and cost.</summary>
+    public string Summary()
+    {
+        if (_resultLine is null)
+        {
+            return "No result from Claude Code.";
+        }
+
+        try
+        {
+            using var result = JsonDocument.Parse(_resultLine);
+            var root = result.RootElement;
+            var subtype = root.TryGetProperty("subtype", out var s) ? s.GetString() : null;
+            var turns = root.TryGetProperty("num_turns", out var t) ? t.GetInt32() : 0;
+            var cost = root.TryGetProperty("total_cost_usd", out var c) ? c.GetDecimal() : 0;
+            var isError = root.TryGetProperty("is_error", out var e) && e.GetBoolean();
+            var text = root.TryGetProperty("result", out var r) ? r.GetString() : null;
+            var summary = $"Claude Code: {subtype}{(isError ? " (error)" : "")}, {turns} turns, ${cost:0.00}.";
+            return isError && !string.IsNullOrEmpty(text) ? $"{summary} {text}" : summary;
+        }
+        catch (JsonException)
+        {
+            return "Claude Code's result couldn't be read.";
+        }
+    }
+
+    private async Task Pump()
+    {
+        var stderr = Task.Run(async () =>
+        {
+            while (await _process.StandardError.ReadLineAsync() is { } line)
+            {
+                lock (_log)
+                {
+                    _log.WriteLine(JsonSerializer.Serialize(new { type = "stderr", text = line }));
+                }
+            }
+        });
+
+        while (await _process.StandardOutput.ReadLineAsync() is { } line)
+        {
+            lock (_log)
+            {
+                _log.WriteLine(line);
+            }
+
+            if (line.StartsWith("{\"type\":\"result\""))
+            {
+                _resultLine = line;
+            }
+        }
+
+        await stderr;
+    }
+
+    public void Dispose()
+    {
+        Kill();
+        _pump.Wait(TimeSpan.FromSeconds(5));
+        _log.Dispose();
+        _process.Dispose();
+    }
+}
+
+static class ClaudeExecutable
+{
+    /// <summary>The configured path; for plain "claude", PATH first, then the Claude desktop app's newest bundled copy.</summary>
+    public static string Resolve(string configured)
+    {
+        if (configured != "claude")
+        {
+            return Paths.Expand(configured);
+        }
+
+        var onPath = (Environment.GetEnvironmentVariable("PATH") ?? "")
+            .Split(Path.PathSeparator)
+            .Select(x => Path.Combine(x, "claude"))
+            .FirstOrDefault(File.Exists);
+        if (onPath is not null)
+        {
+            return onPath;
+        }
+
+        var bundled = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Library/Application Support/Claude/claude-code");
+        var newest = Directory.Exists(bundled)
+            ? Directory.GetDirectories(bundled)
+                .Select(x => (Dir: x, Version: Version.TryParse(Path.GetFileName(x), out var v) ? v : null))
+                .Where(x => x.Version is not null)
+                .OrderByDescending(x => x.Version)
+                .Select(x => Directory.GetFiles(x.Dir, "claude", SearchOption.AllDirectories).FirstOrDefault(f => f.EndsWith("Contents/MacOS/claude")))
+                .FirstOrDefault(x => x is not null)
+            : null;
+        return newest ?? throw new FileNotFoundException("Claude Code wasn't found: put claude on PATH or set claudePath in the config.");
     }
 }
 
@@ -284,8 +584,28 @@ sealed record RunnerConfig
     /// <summary>Where the runner creates a git worktree per issue.</summary>
     public string WorktreeFolder { get; init; } = "~/boards-agent-worktrees";
 
-    /// <summary>The Claude Code executable.</summary>
+    /// <summary>
+    /// The Claude Code executable. "claude" means the one on PATH, or else the newest one bundled with the Claude
+    /// desktop app.
+    /// </summary>
     public string ClaudePath { get; init; } = "claude";
+
+    /// <summary>
+    /// What Claude Code may do without asking, besides editing files in the worktree (--allowedTools). Anything else
+    /// is denied, since nobody is there to approve it.
+    /// </summary>
+    public string[] AllowedTools { get; init; } =
+    [
+        "Bash(dotnet build:*)",
+        "Bash(dotnet test:*)",
+        "Bash(dotnet restore:*)",
+        "Bash(git status:*)",
+        "Bash(git diff:*)",
+        "Bash(git log:*)",
+        "Bash(git show:*)",
+        "Bash(git add:*)",
+        "Bash(git commit:*)",
+    ];
 
     /// <summary>Claude Code's --max-turns.</summary>
     public int MaxTurns { get; init; } = 50;
@@ -295,6 +615,9 @@ sealed record RunnerConfig
 
     /// <summary>A run taking longer than this is stopped and failed.</summary>
     public int TimeoutMinutes { get; init; } = 60;
+
+    /// <summary>How often a working run is checked for a cancel and the timeout.</summary>
+    public int CancelCheckSeconds { get; init; } = 30;
 
     /// <summary>How often Ready runs are polled.</summary>
     public int PollIntervalSeconds { get; init; } = 60;
@@ -430,6 +753,11 @@ sealed class BoardsClient(McpClient client) : IAsyncDisposable
         }
     }
 
+    public Task<IssueDetail> GetIssue(string issueKey, CancellationToken ct)
+    {
+        return Call<IssueDetail>("get_issue", new Dictionary<string, object?> { ["issueKey"] = issueKey }, ct);
+    }
+
     public Task EditIssueStatus(string issueKey, long statusId, string? comment, CancellationToken ct)
     {
         return CallVoid(
@@ -497,6 +825,8 @@ sealed record StatusSummary(long Id, string Name, int CategoryId, string Categor
 sealed record EpicStatusSummary(long EpicId, string EpicName, IReadOnlyList<StatusSummary> Statuses);
 
 sealed record IssueSummary(string Key, string Title, string Status, int StatusCategoryId);
+
+sealed record IssueDetail(string Key, string Title, string Status, int StatusCategoryId, AgentRunSummary? LatestAgentRun);
 
 sealed record IssueListPage(IReadOnlyList<IssueSummary> Issues, long Page, bool HasNextPage);
 

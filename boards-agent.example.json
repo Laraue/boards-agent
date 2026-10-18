@@ -10,9 +10,20 @@
   },
   // Where the worktrees go: <worktreeFolder>/<KEY>.
   "worktreeFolder": "~/boards-agent-worktrees",
+  // "claude" = the one on PATH, or else the newest one bundled with the Claude desktop app.
   "claudePath": "claude",
+  // Limits for one run: Claude Code's --max-turns and --max-budget-usd, and a wall-clock timeout.
   "maxTurns": 50,
   "maxBudgetUsd": 5,
   "timeoutMinutes": 60,
-  "pollIntervalSeconds": 60
+  // What the agent may run without asking, besides editing files in the worktree. Everything else is denied;
+  // git push, gh, WebFetch and WebSearch are always denied. Add your project's build/test commands here.
+  "allowedTools": [
+    "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(dotnet restore:*)",
+    "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(git show:*)",
+    "Bash(git add:*)", "Bash(git commit:*)"
+  ],
+  "pollIntervalSeconds": 60,
+  // How often a working run is checked for a cancel and the timeout.
+  "cancelCheckSeconds": 30
 }
