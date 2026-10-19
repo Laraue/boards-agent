@@ -1,3 +1,5 @@
 boards-agent.json
+boards-agent.*.json
+!boards-agent.example.json
 bin/
 obj/
