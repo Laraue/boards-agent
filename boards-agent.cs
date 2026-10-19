@@ -32,7 +32,7 @@ var me = await boards.GetMe(stop.Token);
 Log.Info($"Connected to {config.McpUrl} as {me.User.DisplayName} ({me.User.Id}), organization {me.Organization.Name}.");
 Log.Info($"Watching spaces: {string.Join(", ", config.Spaces.Keys)}.{(options.DryRun ? " Dry run - nothing is claimed." : $" Claude Code: {ClaudeExecutable.Resolve(config.ClaudePath)}")}");
 
-var runner = new Runner(boards, config, me.User.Id);
+var runner = new Runner(boards, config);
 try
 {
     while (!stop.IsCancellationRequested)
@@ -77,7 +77,7 @@ Log.Info("Stopped.");
 return 0;
 
 /// <summary>Takes one run from claim to finish.</summary>
-sealed class Runner(BoardsClient boards, RunnerConfig config, Guid userId)
+sealed class Runner(BoardsClient boards, RunnerConfig config)
 {
     private const int MaxReasonLength = 4096;
 
@@ -181,22 +181,13 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, Guid userId)
         return issue.LatestAgentRun?.Id == run.Id ? issue.LatestAgentRun.State : null;
     }
 
-    /// <summary>
-    /// The statuses of the issue's epic. MCP doesn't return an issue's epic, so this looks for the issue among the
-    /// user's not-started issues of each epic that can take a hand-off (Created, InProgress and Review statuses).
-    /// </summary>
+    /// <summary>The statuses of the issue's epic, in board order.</summary>
     private async Task<EpicStatusSummary> FindEpicStatuses(string spaceKey, string issueKey, CancellationToken ct)
     {
+        var issue = await boards.GetIssue(issueKey, ct);
         var epics = await boards.ListStatuses(spaceKey, ct);
-        foreach (var epic in epics.Where(e => StatusCategories.CanTakeHandOff(e.Statuses)))
-        {
-            if (await boards.HasIssue(spaceKey, epic.EpicId, userId, StatusCategories.Created, issueKey, ct))
-            {
-                return epic;
-            }
-        }
-
-        throw new InvalidOperationException($"couldn't find the epic of {issueKey} in {spaceKey}");
+        return epics.FirstOrDefault(x => x.EpicId == issue.EpicId)
+            ?? throw new InvalidOperationException($"the statuses of {issueKey}'s epic weren't found in {spaceKey}");
     }
 
     /// <summary>
@@ -251,14 +242,6 @@ static class StatusCategories
     public const int InProgress = 1;
     public const int Completed = 2;
     public const int Review = 3;
-
-    /// <summary>What the server requires of an epic to hand one of its issues off.</summary>
-    public static bool CanTakeHandOff(IReadOnlyList<StatusSummary> statuses)
-    {
-        return statuses.Any(x => x.CategoryId == Created)
-            && statuses.Any(x => x.CategoryId == InProgress)
-            && statuses.Any(x => x.CategoryId == Review);
-    }
 }
 
 /// <summary>A Claude Code process working on one run, in print mode, its stream-json output going to a log file.</summary>
@@ -731,35 +714,6 @@ sealed class BoardsClient(McpClient client) : IAsyncDisposable
         return Call<IReadOnlyList<EpicStatusSummary>>("list_statuses", new Dictionary<string, object?> { ["spaceKey"] = spaceKey }, ct);
     }
 
-    /// <summary>Whether an issue with this key is among the epic's issues of that assignee and status category.</summary>
-    public async Task<bool> HasIssue(string spaceKey, long epicId, Guid assigneeId, int statusCategoryId, string issueKey, CancellationToken ct)
-    {
-        for (var page = 0; ; page++)
-        {
-            var issues = await Call<IssueListPage>(
-                "list_issues",
-                new Dictionary<string, object?>
-                {
-                    ["spaceKey"] = spaceKey,
-                    ["epicId"] = epicId,
-                    ["assigneeId"] = assigneeId,
-                    ["statusCategoryId"] = statusCategoryId,
-                    ["page"] = page,
-                    ["count"] = PageSize,
-                },
-                ct);
-            if (issues.Issues.Any(x => x.Key == issueKey))
-            {
-                return true;
-            }
-
-            if (!issues.HasNextPage)
-            {
-                return false;
-            }
-        }
-    }
-
     public Task<IssueDetail> GetIssue(string issueKey, CancellationToken ct)
     {
         return Call<IssueDetail>("get_issue", new Dictionary<string, object?> { ["issueKey"] = issueKey }, ct);
@@ -831,11 +785,7 @@ sealed record StatusSummary(long Id, string Name, int CategoryId, string Categor
 
 sealed record EpicStatusSummary(long EpicId, string EpicName, IReadOnlyList<StatusSummary> Statuses);
 
-sealed record IssueSummary(string Key, string Title, string Status, int StatusCategoryId);
-
-sealed record IssueDetail(string Key, string Title, string Status, int StatusCategoryId, AgentRunSummary? LatestAgentRun);
-
-sealed record IssueListPage(IReadOnlyList<IssueSummary> Issues, long Page, bool HasNextPage);
+sealed record IssueDetail(string Key, string Title, string Status, long? StatusId, long? EpicId, int StatusCategoryId, AgentRunSummary? LatestAgentRun);
 
 static class Json
 {
