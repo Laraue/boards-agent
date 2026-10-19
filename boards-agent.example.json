@@ -1,5 +1,5 @@
 {
-  // The Boards MCP endpoint. Production: https://boards.laraue.com/mcp
+  // The Boards MCP endpoint. Production: https://boards.laraue.com/boards-mcp/mcp
   "mcpUrl": "http://localhost:5202/mcp",
   // The environment variable that holds your Boards API key (Account -> API keys). Never put the key here.
   "apiKeyEnv": "BOARDS_AGENT_API_KEY",
