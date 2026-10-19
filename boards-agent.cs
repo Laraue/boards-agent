@@ -1671,14 +1671,18 @@ static class BoardsSignIn
     private const int MaxMachineNameLength = 44;
 
     /// <param name="openBrowser">False prints the link only, e.g. over SSH, to open it on another device.</param>
-    public static async Task<SignedIn?> RunAsync(RunnerConfig config, bool openBrowser, CancellationToken ct)
+    /// <param name="replacesApiKey">
+    /// The key this machine held so far: Boards revokes exactly that key once the new one is issued (only if it's the
+    /// same user's, in the same organization), instead of leaving it active.
+    /// </param>
+    public static async Task<SignedIn?> RunAsync(RunnerConfig config, bool openBrowser, string? replacesApiKey, CancellationToken ct)
     {
         using var http = new HttpClient { BaseAddress = new Uri(config.ApiUrl.TrimEnd('/') + "/") };
 
         var start = await PostAsync(
             http,
             "api/agent-sign-in",
-            new JsonObject { ["machineName"] = MachineName() },
+            new JsonObject { ["machineName"] = MachineName(), ["replacesApiKey"] = replacesApiKey },
             RunnerJson.Default.AgentSignInStart,
             ct);
 
@@ -1791,7 +1795,11 @@ static class Setup
 
         if (me is null)
         {
-            var signedIn = await BoardsSignIn.RunAsync(config, !options.NoBrowser, ct);
+            // Only the key this machine stored itself, never BOARDS_AGENT_API_KEY, which may be a key made for something else.
+            var storedKey = config.OrganizationId is { } previousOrganizationId
+                ? CredentialStore.Load(CredentialStore.Account(previousOrganizationId))
+                : null;
+            var signedIn = await BoardsSignIn.RunAsync(config, !options.NoBrowser, storedKey, ct);
             if (signedIn is null)
             {
                 return 1;
