@@ -14,6 +14,10 @@ using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 
 var options = RunnerArgs.Parse(args);
+if (options.LogPath is not null)
+{
+    Log.ToFile(options.LogPath);
+}
 if (options.Version)
 {
     Console.WriteLine($"boards-agent {RunnerVersion.Value}");
@@ -549,7 +553,10 @@ static class AgentPlugin
 
 static class ClaudeExecutable
 {
-    /// <summary>The configured path; for plain "claude", PATH first, then the Claude desktop app's newest bundled copy.</summary>
+    /// <summary>
+    /// The configured path; for plain "claude", PATH (and ~/.local/bin, where the native installer puts it) first, then the
+    /// Claude desktop app's newest bundled copy.
+    /// </summary>
     public static string Resolve(string configured)
     {
         if (configured != "claude")
@@ -557,22 +564,31 @@ static class ClaudeExecutable
             return Paths.Expand(configured);
         }
 
-        var onPath = (Environment.GetEnvironmentVariable("PATH") ?? "")
-            .Split(Path.PathSeparator)
-            .Select(x => Path.Combine(x, "claude"))
+        // On Windows, the native claude.exe before npm's claude.cmd shim, which goes through cmd.exe's argument quoting.
+        string[] names = OperatingSystem.IsWindows() ? ["claude.exe", "claude.cmd"] : ["claude"];
+        var folders = (Environment.GetEnvironmentVariable("PATH") ?? "")
+            .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+            .Append(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin"))
+            .ToList();
+        var onPath = names
+            .SelectMany(name => folders.Select(folder => Path.Combine(folder, name)))
             .FirstOrDefault(File.Exists);
         if (onPath is not null)
         {
             return onPath;
         }
 
-        var bundled = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Library/Application Support/Claude/claude-code");
+        var bundled = OperatingSystem.IsWindows()
+            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Claude", "claude-code")
+            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Library/Application Support/Claude/claude-code");
+        var bundledName = OperatingSystem.IsWindows() ? "claude.exe" : "claude";
         var newest = Directory.Exists(bundled)
             ? Directory.GetDirectories(bundled)
                 .Select(x => (Dir: x, Version: Version.TryParse(Path.GetFileName(x), out var v) ? v : null))
                 .Where(x => x.Version is not null)
                 .OrderByDescending(x => x.Version)
-                .Select(x => Directory.GetFiles(x.Dir, "claude", SearchOption.AllDirectories).FirstOrDefault(f => f.EndsWith("Contents/MacOS/claude")))
+                .Select(x => Directory.GetFiles(x.Dir, bundledName, SearchOption.AllDirectories)
+                    .FirstOrDefault(f => OperatingSystem.IsWindows() || f.EndsWith("Contents/MacOS/claude")))
                 .FirstOrDefault(x => x is not null)
             : null;
         return newest ?? throw new FileNotFoundException("Claude Code wasn't found: put claude on PATH or set claudePath in the config.");
@@ -766,14 +782,15 @@ sealed record RunnerArgs(
     string? ApiUrl,
     string? McpUrl,
     bool NoBrowser,
-    string? ServiceAction)
+    string? ServiceAction,
+    string? LogPath)
 {
     public const string SetupCommand = "setup";
 
     public const string ServiceCommand = "service";
 
     private const string Usage =
-        "Usage: boards-agent [setup] [--config <file>] [--once] [--dry-run] [--check] [--version]\n" +
+        "Usage: boards-agent [setup] [--config <file>] [--log <file>] [--once] [--dry-run] [--check] [--version]\n" +
         "       boards-agent setup [--no-browser] [--web-url <url>] [--api-url <url>] [--mcp-url <url>]\n" +
         "       boards-agent service install|uninstall|status [--config <file>]";
 
@@ -790,6 +807,7 @@ sealed record RunnerArgs(
         string? mcpUrl = null;
         var noBrowser = false;
         string? serviceAction = null;
+        string? logPath = null;
         for (var i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -812,6 +830,9 @@ sealed record RunnerArgs(
                     break;
                 case "--mcp-url" when i + 1 < args.Length:
                     mcpUrl = args[++i];
+                    break;
+                case "--log" when i + 1 < args.Length:
+                    logPath = Paths.Expand(args[++i]);
                     break;
                 case "--no-browser":
                     noBrowser = true;
@@ -838,7 +859,7 @@ sealed record RunnerArgs(
             throw new ArgumentException($"Unknown service action: {serviceAction}.\n{Usage}");
         }
 
-        return new RunnerArgs(command, configPath, once, dryRun, check, version, webUrl, apiUrl, mcpUrl, noBrowser, serviceAction);
+        return new RunnerArgs(command, configPath, once, dryRun, check, version, webUrl, apiUrl, mcpUrl, noBrowser, serviceAction, logPath);
     }
 }
 
@@ -1148,31 +1169,38 @@ sealed record IssueDetail(string Key, string Title, string Status, long? StatusI
 partial class RunnerJson : JsonSerializerContext;
 
 /// <summary>
-/// `boards-agent service`: runs the runner in the background as a launchd LaunchAgent (macOS), started at login and
-/// restarted if it stops, logging to <see cref="LogPath"/>. systemd and Windows aren't supported yet.
+/// `boards-agent service`: runs the runner in the background as the signed-in user - where their credential store and
+/// Claude Code sign-in are - started at login and restarted if it stops. A launchd LaunchAgent on macOS, a Task Scheduler
+/// logon task on Windows. systemd isn't supported yet.
 /// </summary>
 static class Service
 {
     private const string Label = "com.laraue.boards-agent";
 
-    public static bool IsSupported => OperatingSystem.IsMacOS();
+    private const string TaskName = "boards-agent";
 
-    public static bool IsInstalled => File.Exists(PlistPath);
+    public static bool IsSupported => OperatingSystem.IsMacOS() || OperatingSystem.IsWindows();
+
+    public static bool IsInstalled => OperatingSystem.IsWindows()
+        ? Shell.Run("schtasks", "/Query", "/TN", TaskName).ExitCode == 0
+        : File.Exists(PlistPath);
 
     private static string Home => Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
 
     private static string PlistPath => Path.Combine(Home, "Library", "LaunchAgents", $"{Label}.plist");
 
-    public static string LogPath => Path.Combine(Home, "Library", "Logs", "boards-agent", "boards-agent.log");
+    public static string LogPath => OperatingSystem.IsWindows()
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "boards-agent", "boards-agent.log")
+        : Path.Combine(Home, "Library", "Logs", "boards-agent", "boards-agent.log");
 
     /// <summary>launchd's domain for the signed-in user's GUI session - where the Keychain is unlocked.</summary>
-    private static string Domain => $"gui/{Uid()}";
+    private static string Domain => $"gui/{Shell.Run("/usr/bin/id", "-u").Output.Trim()}";
 
     public static int Run(RunnerArgs options)
     {
         if (!IsSupported)
         {
-            Console.WriteLine("The background service is macOS-only for now. Run `boards-agent` in a terminal instead.");
+            Console.WriteLine("The background service isn't supported on this system yet. Run `boards-agent` in a terminal instead.");
             return 1;
         }
 
@@ -1189,7 +1217,7 @@ static class Service
         var executable = StableExecutablePath();
         if (executable is null)
         {
-            Console.WriteLine("The service needs the boards-agent binary (e.g. from Homebrew), not `dotnet run`.");
+            Console.WriteLine("The service needs the installed boards-agent binary, not `dotnet run`.");
             return 1;
         }
 
@@ -1200,36 +1228,50 @@ static class Service
             return 1;
         }
 
-        Directory.CreateDirectory(Path.GetDirectoryName(PlistPath)!);
         Directory.CreateDirectory(Path.GetDirectoryName(LogPath)!);
-        File.WriteAllText(PlistPath, Plist(executable, configPath));
-
-        Shell.Run("/bin/launchctl", "bootout", $"{Domain}/{Label}");
-        var bootstrap = Shell.Run("/bin/launchctl", "bootstrap", Domain, PlistPath);
-        if (bootstrap.ExitCode != 0)
+        var error = OperatingSystem.IsWindows()
+            ? InstallTask(executable, configPath)
+            : InstallLaunchAgent(executable, configPath);
+        if (error is not null)
         {
-            Console.WriteLine($"launchctl couldn't start the service: {bootstrap.Error.Trim()}");
+            Console.WriteLine($"The service couldn't be started: {error}");
             return 1;
         }
 
-        Console.WriteLine("The agent runs in the background now, and starts again when you sign in to your Mac.");
+        Console.WriteLine($"The agent runs in the background now, and starts again when you sign in to your {(OperatingSystem.IsWindows() ? "PC" : "Mac")}.");
         Console.WriteLine($"Log: {LogPath}");
         Console.WriteLine("Hand an issue to the agent in Boards. `boards-agent service status` shows what it's doing.");
         return 0;
     }
 
-    /// <summary>Restarts the running service, e.g. after setup changed the config.</summary>
+    /// <summary>Restarts the running service, e.g. after setup changed the config or an update replaced the binary.</summary>
     public static void Restart()
     {
-        Shell.Run("/bin/launchctl", "kickstart", "-k", $"{Domain}/{Label}");
+        if (OperatingSystem.IsWindows())
+        {
+            Shell.Run("schtasks", "/End", "/TN", TaskName);
+            Shell.Run("schtasks", "/Run", "/TN", TaskName);
+        }
+        else
+        {
+            Shell.Run("/bin/launchctl", "kickstart", "-k", $"{Domain}/{Label}");
+        }
     }
 
     private static int Uninstall()
     {
-        Shell.Run("/bin/launchctl", "bootout", $"{Domain}/{Label}");
-        if (File.Exists(PlistPath))
+        if (OperatingSystem.IsWindows())
         {
-            File.Delete(PlistPath);
+            Shell.Run("schtasks", "/End", "/TN", TaskName);
+            Shell.Run("schtasks", "/Delete", "/TN", TaskName, "/F");
+        }
+        else
+        {
+            Shell.Run("/bin/launchctl", "bootout", $"{Domain}/{Label}");
+            if (File.Exists(PlistPath))
+            {
+                File.Delete(PlistPath);
+            }
         }
 
         Console.WriteLine($"The background service is removed. The log stays at {LogPath}.");
@@ -1244,28 +1286,43 @@ static class Service
             return 1;
         }
 
-        var print = Shell.Run("/bin/launchctl", "print", $"{Domain}/{Label}");
-        var state = print.ExitCode == 0
-            ? print.Output.Split('\n').Select(x => x.Trim()).FirstOrDefault(x => x.StartsWith("state = "))?["state = ".Length..] ?? "unknown"
-            : "not loaded";
-        var pid = print.Output.Split('\n').Select(x => x.Trim()).FirstOrDefault(x => x.StartsWith("pid = "))?["pid = ".Length..];
-        Console.WriteLine($"Service: {state}{(pid is null ? "" : $" (pid {pid})")}");
+        int exitCode;
+        if (OperatingSystem.IsWindows())
+        {
+            var query = Shell.Run("schtasks", "/Query", "/TN", TaskName, "/FO", "LIST");
+            Console.WriteLine(query.Output.Trim());
+            exitCode = query.ExitCode;
+        }
+        else
+        {
+            var print = Shell.Run("/bin/launchctl", "print", $"{Domain}/{Label}");
+            var lines = print.Output.Split('\n').Select(x => x.Trim()).ToList();
+            var state = print.ExitCode == 0
+                ? lines.FirstOrDefault(x => x.StartsWith("state = "))?["state = ".Length..] ?? "unknown"
+                : "not loaded";
+            var pid = lines.FirstOrDefault(x => x.StartsWith("pid = "))?["pid = ".Length..];
+            Console.WriteLine($"Service: {state}{(pid is null ? "" : $" (pid {pid})")}");
+            exitCode = print.ExitCode;
+        }
+
         Console.WriteLine($"Log: {LogPath}");
         if (File.Exists(LogPath))
         {
             Console.WriteLine();
-            foreach (var line in File.ReadLines(LogPath).TakeLast(15))
+            using var log = new FileStream(LogPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var reader = new StreamReader(log);
+            foreach (var line in reader.ReadToEnd().Split('\n').Where(x => x.Length > 0).TakeLast(15))
             {
-                Console.WriteLine(line);
+                Console.WriteLine(line.TrimEnd('\r'));
             }
         }
 
-        return print.ExitCode == 0 ? 0 : 1;
+        return exitCode == 0 ? 0 : 1;
     }
 
     /// <summary>
-    /// The binary to start: Homebrew's version-free link rather than the versioned Cellar path, so the service keeps
-    /// working after `brew upgrade`. Null when the runner runs as `dotnet run` rather than as a binary.
+    /// The binary to start: Homebrew's version-free link rather than the versioned Cellar path, so the service survives
+    /// `brew upgrade`. Null when the runner runs as `dotnet run` rather than as a binary.
     /// </summary>
     private static string? StableExecutablePath()
     {
@@ -1288,14 +1345,22 @@ static class Service
         return path;
     }
 
+    private static string? InstallLaunchAgent(string executable, string configPath)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(PlistPath)!);
+        File.WriteAllText(PlistPath, Plist(executable, configPath));
+
+        Shell.Run("/bin/launchctl", "bootout", $"{Domain}/{Label}");
+        var bootstrap = Shell.Run("/bin/launchctl", "bootstrap", Domain, PlistPath);
+        return bootstrap.ExitCode == 0 ? null : bootstrap.Error.Trim();
+    }
+
     /// <summary>
     /// The LaunchAgent. It gets this shell's PATH, since launchd's own is minimal and Claude Code runs the project's
-    /// build tools (dotnet, node, ...) through it.
+    /// build tools (dotnet, node, ...) through it. launchd writes the runner's output to the log.
     /// </summary>
     private static string Plist(string executable, string configPath)
     {
-        static string Escape(string value) => System.Security.SecurityElement.Escape(value);
-
         var path = Environment.GetEnvironmentVariable("PATH") ?? "/usr/bin:/bin:/usr/sbin:/sbin";
         return $"""
             <?xml version="1.0" encoding="UTF-8"?>
@@ -1306,17 +1371,17 @@ static class Service
               <string>{Label}</string>
               <key>ProgramArguments</key>
               <array>
-                <string>{Escape(executable)}</string>
+                <string>{Xml(executable)}</string>
                 <string>--config</string>
-                <string>{Escape(configPath)}</string>
+                <string>{Xml(configPath)}</string>
               </array>
               <key>EnvironmentVariables</key>
               <dict>
                 <key>PATH</key>
-                <string>{Escape(path)}</string>
+                <string>{Xml(path)}</string>
               </dict>
               <key>WorkingDirectory</key>
-              <string>{Escape(Home)}</string>
+              <string>{Xml(Home)}</string>
               <key>RunAtLoad</key>
               <true/>
               <key>KeepAlive</key>
@@ -1324,17 +1389,91 @@ static class Service
               <key>ThrottleInterval</key>
               <integer>60</integer>
               <key>StandardOutPath</key>
-              <string>{Escape(LogPath)}</string>
+              <string>{Xml(LogPath)}</string>
               <key>StandardErrorPath</key>
-              <string>{Escape(LogPath)}</string>
+              <string>{Xml(LogPath)}</string>
             </dict>
             </plist>
             """;
     }
 
-    private static string Uid()
+    private static string? InstallTask(string executable, string configPath)
     {
-        return Shell.Run("/usr/bin/id", "-u").Output.Trim();
+        var definition = Path.Combine(Path.GetTempPath(), $"boards-agent-task-{Guid.NewGuid():N}.xml");
+        try
+        {
+            // Task Scheduler reads the definition as UTF-16.
+            File.WriteAllText(definition, TaskXml(executable, configPath), System.Text.Encoding.Unicode);
+            Shell.Run("schtasks", "/End", "/TN", TaskName);
+            var create = Shell.Run("schtasks", "/Create", "/TN", TaskName, "/XML", definition, "/F");
+            if (create.ExitCode != 0)
+            {
+                return create.Error.Trim();
+            }
+
+            var run = Shell.Run("schtasks", "/Run", "/TN", TaskName);
+            return run.ExitCode == 0 ? null : run.Error.Trim();
+        }
+        finally
+        {
+            File.Delete(definition);
+        }
+    }
+
+    /// <summary>
+    /// The logon task: runs as the user (so it sees their Credential Manager and Claude Code sign-in) with no time limit,
+    /// restarted if it fails. conhost --headless keeps a console app from opening a window; the runner writes the log
+    /// itself, since a task has no output redirection.
+    /// </summary>
+    private static string TaskXml(string executable, string configPath)
+    {
+        var user = $"{Environment.UserDomainName}\\{Environment.UserName}";
+        var arguments = $"--headless \"{executable}\" --config \"{configPath}\" --log \"{LogPath}\"";
+        return $"""
+            <?xml version="1.0" encoding="UTF-16"?>
+            <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+              <RegistrationInfo>
+                <Description>boards-agent: works on Laraue Boards issues handed to the agent.</Description>
+              </RegistrationInfo>
+              <Triggers>
+                <LogonTrigger>
+                  <Enabled>true</Enabled>
+                  <UserId>{Xml(user)}</UserId>
+                </LogonTrigger>
+              </Triggers>
+              <Principals>
+                <Principal id="Author">
+                  <UserId>{Xml(user)}</UserId>
+                  <LogonType>InteractiveToken</LogonType>
+                  <RunLevel>LeastPrivilege</RunLevel>
+                </Principal>
+              </Principals>
+              <Settings>
+                <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+                <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+                <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+                <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+                <RestartOnFailure>
+                  <Interval>PT1M</Interval>
+                  <Count>999</Count>
+                </RestartOnFailure>
+                <StartWhenAvailable>true</StartWhenAvailable>
+                <Enabled>true</Enabled>
+              </Settings>
+              <Actions Context="Author">
+                <Exec>
+                  <Command>conhost.exe</Command>
+                  <Arguments>{Xml(arguments)}</Arguments>
+                  <WorkingDirectory>{Xml(Home)}</WorkingDirectory>
+                </Exec>
+              </Actions>
+            </Task>
+            """;
+    }
+
+    private static string Xml(string value)
+    {
+        return System.Security.SecurityElement.Escape(value);
     }
 }
 
@@ -1355,7 +1494,8 @@ static class ApiKeySource
 }
 
 /// <summary>
-/// The API key in the OS credential store: the macOS Keychain (security), or the Secret Service on Linux (secret-tool).
+/// The API key in the OS credential store: the macOS Keychain (security), the Secret Service on Linux (secret-tool), or
+/// the Windows Credential Manager.
 /// One entry per organization. The key never goes on a command line - it's passed on stdin - and never to a file.
 /// </summary>
 static class CredentialStore
@@ -1389,6 +1529,11 @@ static class CredentialStore
 
             result = Shell.Run(info, secret);
         }
+        else if (OperatingSystem.IsWindows())
+        {
+            WindowsCredentials.Write($"{Service}:{account}", label, secret);
+            return;
+        }
         else
         {
             throw new PlatformNotSupportedException(
@@ -1413,12 +1558,100 @@ static class CredentialStore
         {
             result = Shell.Run("secret-tool", "lookup", "service", Service, "account", account);
         }
+        else if (OperatingSystem.IsWindows())
+        {
+            return WindowsCredentials.Read($"{Service}:{account}");
+        }
         else
         {
             return null;
         }
 
         return result.ExitCode == 0 && result.Output.Trim() is { Length: > 0 } secret ? secret : null;
+    }
+}
+
+/// <summary>A generic credential in the Windows Credential Manager, through advapi32's CredWrite/CredRead.</summary>
+static class WindowsCredentials
+{
+    private const int GenericType = 1;
+
+    private const int PersistLocalMachine = 2;
+
+    [System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential, CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private struct Credential
+    {
+        public int Flags;
+        public int Type;
+        public string TargetName;
+        public string? Comment;
+        public int LastWrittenLow;
+        public int LastWrittenHigh;
+        public int CredentialBlobSize;
+        public IntPtr CredentialBlob;
+        public int Persist;
+        public int AttributeCount;
+        public IntPtr Attributes;
+        public string? TargetAlias;
+        public string? UserName;
+    }
+
+    [System.Runtime.InteropServices.DllImport("advapi32.dll", EntryPoint = "CredWriteW", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    private static extern bool CredWrite(ref Credential credential, int flags);
+
+    [System.Runtime.InteropServices.DllImport("advapi32.dll", EntryPoint = "CredReadW", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+    private static extern bool CredRead(string target, int type, int flags, out IntPtr credential);
+
+    [System.Runtime.InteropServices.DllImport("advapi32.dll")]
+    private static extern void CredFree(IntPtr buffer);
+
+    public static void Write(string target, string label, string secret)
+    {
+        var blob = System.Text.Encoding.UTF8.GetBytes(secret);
+        var buffer = System.Runtime.InteropServices.Marshal.AllocHGlobal(blob.Length);
+        try
+        {
+            System.Runtime.InteropServices.Marshal.Copy(blob, 0, buffer, blob.Length);
+            var credential = new Credential
+            {
+                Type = GenericType,
+                TargetName = target,
+                Comment = label,
+                CredentialBlobSize = blob.Length,
+                CredentialBlob = buffer,
+                Persist = PersistLocalMachine,
+                UserName = Environment.UserName,
+            };
+            if (!CredWrite(ref credential, 0))
+            {
+                throw new InvalidOperationException(
+                    $"Couldn't save the API key in the Credential Manager (error {System.Runtime.InteropServices.Marshal.GetLastPInvokeError()}).");
+            }
+        }
+        finally
+        {
+            System.Runtime.InteropServices.Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    public static string? Read(string target)
+    {
+        if (!CredRead(target, GenericType, 0, out var pointer))
+        {
+            return null;
+        }
+
+        try
+        {
+            var credential = System.Runtime.InteropServices.Marshal.PtrToStructure<Credential>(pointer);
+            var blob = new byte[credential.CredentialBlobSize];
+            System.Runtime.InteropServices.Marshal.Copy(credential.CredentialBlob, blob, 0, blob.Length);
+            return System.Text.Encoding.UTF8.GetString(blob);
+        }
+        finally
+        {
+            CredFree(pointer);
+        }
     }
 }
 
@@ -1765,13 +1998,34 @@ static class Paths
 
 static class Log
 {
+    private static StreamWriter? _file;
+
+    /// <summary>Also appends every line to <paramref name="path"/> - for the Windows logon task, which has no output redirection.</summary>
+    public static void ToFile(string path)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        _file = new StreamWriter(new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.ReadWrite)) { AutoFlush = true };
+    }
+
     public static void Info(string message)
     {
-        Console.WriteLine($"{DateTime.Now:HH:mm:ss} {message}");
+        Write(Console.Out, $"{DateTime.Now:HH:mm:ss} {message}");
     }
 
     public static void Error(string message)
     {
-        Console.Error.WriteLine($"{DateTime.Now:HH:mm:ss} ERROR {message}");
+        Write(Console.Error, $"{DateTime.Now:HH:mm:ss} ERROR {message}");
+    }
+
+    private static void Write(TextWriter console, string line)
+    {
+        console.WriteLine(line);
+        if (_file is { } file)
+        {
+            lock (file)
+            {
+                file.WriteLine(line);
+            }
+        }
     }
 }
