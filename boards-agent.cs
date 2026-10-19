@@ -114,7 +114,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config)
             return true;
         }
 
-        await Work(run, worktree, ct);
+        await Work(spaceKey, run, worktree, ct);
         return true;
     }
 
@@ -122,10 +122,10 @@ sealed class Runner(BoardsClient boards, RunnerConfig config)
     /// Runs Claude Code in the worktree until it exits, the run is cancelled, or the timeout passes. The agent
     /// reports and finishes the run itself; the runner only finishes it when the agent couldn't.
     /// </summary>
-    private async Task Work(AgentRunSummary run, Worktree worktree, CancellationToken ct)
+    private async Task Work(string spaceKey, AgentRunSummary run, Worktree worktree, CancellationToken ct)
     {
         var logPath = Path.Combine(config.WorktreeFolder, $"{run.IssueKey}.run-{run.Id}.jsonl");
-        using var agent = ClaudeAgent.Start(config, run, worktree, logPath);
+        using var agent = ClaudeAgent.Start(config, spaceKey, run, worktree, logPath);
         Log.Info($"{run.IssueKey}: Claude Code started (pid {agent.ProcessId}), log {logPath}.");
 
         var deadline = DateTime.UtcNow.AddMinutes(config.TimeoutMinutes);
@@ -171,6 +171,11 @@ sealed class Runner(BoardsClient boards, RunnerConfig config)
         if (finalState == AgentRunStates.Working)
         {
             await Fail(run, "Claude Code stopped without finishing", $"Exit code {agent.ExitCode}. {agent.Summary()}");
+        }
+        else if (finalState is AgentRunStates.Done or AgentRunStates.Failed)
+        {
+            // The agent can't know what it cost; the runner adds it under the agent's own summary.
+            await boards.CreateComment(run.IssueKey, $"_boards-agent: {agent.Summary()}_", CancellationToken.None);
         }
     }
 
@@ -231,6 +236,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config)
 static class AgentRunStates
 {
     public const string Working = "Working";
+    public const string Done = "Done";
     public const string Failed = "Failed";
     public const string Cancelled = "Cancelled";
 }
@@ -289,7 +295,7 @@ sealed class ClaudeAgent : IDisposable
 
     public int ExitCode => _process.ExitCode;
 
-    public static ClaudeAgent Start(RunnerConfig config, AgentRunSummary run, Worktree worktree, string logPath)
+    public static ClaudeAgent Start(RunnerConfig config, string spaceKey, AgentRunSummary run, Worktree worktree, string logPath)
     {
         var mcpConfigPath = Path.Combine(config.WorktreeFolder, $"{run.IssueKey}.mcp.json");
         File.WriteAllText(mcpConfigPath, McpConfig(config));
@@ -303,7 +309,8 @@ sealed class ClaudeAgent : IDisposable
         };
         string[] arguments =
         [
-            "-p", Prompt(run, worktree),
+            "-p", Prompt(spaceKey, run, worktree),
+            "--plugin-dir", AgentPlugin.Directory.Value,
             "--output-format", "stream-json",
             "--verbose",
             "--permission-mode", "acceptEdits",
@@ -311,7 +318,7 @@ sealed class ClaudeAgent : IDisposable
             "--mcp-config", mcpConfigPath,
             "--strict-mcp-config",
             "--setting-sources", "project",
-            "--allowedTools", .. config.AllowedTools, .. BoardsTools.Select(x => $"mcp__boards__{x}"),
+            "--allowedTools", "Skill(boards-agent:work-on-issue)", .. config.AllowedTools, .. BoardsTools.Select(x => $"mcp__boards__{x}"),
             "--disallowedTools", .. DisallowedTools,
         ];
         foreach (var argument in arguments)
@@ -348,14 +355,13 @@ sealed class ClaudeAgent : IDisposable
         return JsonSerializer.Serialize(new Dictionary<string, object> { ["mcpServers"] = new Dictionary<string, object> { ["boards"] = server } });
     }
 
-    private static string Prompt(AgentRunSummary run, Worktree worktree)
+    private static string Prompt(string spaceKey, AgentRunSummary run, Worktree worktree)
     {
         return $"""
-            You are working on Laraue Boards issue {run.IssueKey} ("{run.IssueTitle}"), agent run {run.Id}.
-            You are in a git worktree on branch {worktree.Branch}. Read the issue with the boards get_issue tool, do the
-            work it describes here, and commit it on this branch. Never push.
-            When you're done, post a short summary with create_comment and call finish_agent_run({run.Id}, "Done").
-            If you can't do it, call finish_agent_run({run.Id}, "Failed", <why>).
+            Use the boards-agent:work-on-issue skill to work on this Laraue Boards issue.
+            - Issue: {run.IssueKey} in space {spaceKey}
+            - Agent run id: {run.Id}
+            - Branch: {worktree.Branch}, started from {worktree.BaseRef}
             """;
     }
 
@@ -451,6 +457,38 @@ sealed class ClaudeAgent : IDisposable
     }
 }
 
+/// <summary>The work-on-issue skill, embedded in the runner as a Claude Code plugin and written out once per start.</summary>
+static class AgentPlugin
+{
+    private const string Prefix = "plugin/";
+
+    public static readonly Lazy<string> Directory = new(Extract);
+
+    private static string Extract()
+    {
+        var assembly = typeof(AgentPlugin).Assembly;
+        var target = Path.Combine(Path.GetTempPath(), $"boards-agent-plugin-{Environment.ProcessId}");
+        foreach (var name in assembly.GetManifestResourceNames())
+        {
+            var relative = name.Replace('\\', '/');
+            if (!relative.StartsWith(Prefix))
+            {
+                continue;
+            }
+
+            var path = Path.Combine(target, relative[Prefix.Length..]);
+            System.IO.Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            using var resource = assembly.GetManifestResourceStream(name)!;
+            using var file = File.Create(path);
+            resource.CopyTo(file);
+        }
+
+        return File.Exists(Path.Combine(target, ".claude-plugin", "plugin.json"))
+            ? target
+            : throw new InvalidOperationException("The agent skill isn't embedded in this build of boards-agent.");
+    }
+}
+
 static class ClaudeExecutable
 {
     /// <summary>The configured path; for plain "claude", PATH first, then the Claude desktop app's newest bundled copy.</summary>
@@ -483,7 +521,7 @@ static class ClaudeExecutable
     }
 }
 
-sealed record Worktree(string Path, string Branch);
+sealed record Worktree(string Path, string Branch, string BaseRef);
 
 static class Git
 {
@@ -497,7 +535,7 @@ static class Git
         var path = System.IO.Path.Combine(worktreeFolder, issueKey);
         if (Directory.Exists(path))
         {
-            return new Worktree(path, branch);
+            return new Worktree(path, branch, baseRef);
         }
 
         Directory.CreateDirectory(worktreeFolder);
@@ -511,7 +549,7 @@ static class Git
             Run(repo, ["worktree", "add", "-b", branch, path, baseRef]);
         }
 
-        return new Worktree(path, branch);
+        return new Worktree(path, branch, baseRef);
     }
 
     private static ProcessResult Run(string workingDirectory, string[] arguments, bool throwOnError = true)

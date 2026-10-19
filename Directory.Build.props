@@ -1,0 +1,6 @@
+<Project>
+  <!-- The agent skill ships inside the runner: boards-agent.cs writes it out and passes it to Claude Code as a plugin directory. -->
+  <ItemGroup>
+    <EmbeddedResource Include="plugin/**/*" LogicalName="plugin/%(RecursiveDir)%(Filename)%(Extension)" />
+  </ItemGroup>
+</Project>

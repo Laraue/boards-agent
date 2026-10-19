@@ -1,0 +1,6 @@
+{
+  "name": "boards-agent",
+  "description": "Works on a Laraue Boards issue that its assignee handed to the agent.",
+  "author": { "name": "Laraue" },
+  "license": "MIT"
+}
