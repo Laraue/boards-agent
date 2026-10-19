@@ -26,6 +26,27 @@ While a run is open, the issue is locked: it can't be edited or deleted. Status 
 - The skill takes instructions only from the issue text and the assignee's own comments. Comments by anyone else are treated as untrusted data.
 - Your API key is read from an environment variable and never written to disk. The MCP config passes it to Claude Code as `${BOARDS_AGENT_API_KEY}`.
 
+## Install
+
+Download the archive for your system from [Releases](https://github.com/Laraue/boards-agent/releases): `osx-arm64` (Apple Silicon), `osx-x64`, `linux-x64`, `linux-arm64` or `win-x64`. Each one is a single self-contained binary, with no .NET needed, plus the README, the license and an example config. `SHA256SUMS` lists the checksums.
+
+```bash
+tar -xzf boards-agent-v0.1.0-osx-arm64.tar.gz
+cd boards-agent
+cp boards-agent.example.json boards-agent.json   # then map your spaces to local checkouts
+export BOARDS_AGENT_API_KEY=<your key>
+./boards-agent --check
+./boards-agent
+```
+
+The macOS binaries aren't notarized yet. If macOS refuses to open the binary, allow it in System Settings -> Privacy & Security, or run `xattr -d com.apple.quarantine boards-agent`.
+
+`--check` prints the version, which Claude Code it found, and who your key signs in as. `--dry-run` lists Ready runs without claiming them. `--once` polls once and exits.
+
+## Release
+
+Push a `v*` tag (e.g. `v0.1.0`; `v0.1.0-beta.1` makes a pre-release). The Release workflow builds the binaries and publishes them as a GitHub release.
+
 ## Run from source
 
 You need the .NET 10 SDK and Claude Code (on `PATH`, or the copy bundled with the Claude desktop app).
@@ -38,8 +59,6 @@ You need the .NET 10 SDK and Claude Code (on `PATH`, or the copy bundled with th
 export BOARDS_AGENT_API_KEY=<your key>
 dotnet run boards-agent.cs
 ```
-
-`--dry-run` lists Ready runs without claiming them. `--once` polls once and exits.
 
 ## License
 

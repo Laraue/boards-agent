@@ -1,6 +1,6 @@
 #!/usr/bin/env dotnet
 // boards-agent: picks up Laraue Boards issues handed to the agent and works on them with Claude Code.
-// Run: dotnet run boards-agent.cs -- [--config boards-agent.json] [--once] [--dry-run]
+// Run: dotnet run boards-agent.cs -- [--config boards-agent.json] [--once] [--dry-run] [--check] [--version]
 #:package ModelContextProtocol.Core@1.4.0
 #:property PublishAot=false
 
@@ -10,7 +10,19 @@ using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 
 var options = RunnerArgs.Parse(args);
+if (options.Version)
+{
+    Console.WriteLine($"boards-agent {RunnerVersion.Value}");
+    return 0;
+}
+
 var config = RunnerConfig.Load(options.ConfigPath);
+if (options.Check)
+{
+    Console.WriteLine($"boards-agent {RunnerVersion.Value}");
+    Console.WriteLine($"Claude Code: {ClaudeExecutable.Resolve(config.ClaudePath)}");
+    Console.WriteLine($"Agent skill: {AgentPlugin.Directory.Value}");
+}
 
 var apiKey = Environment.GetEnvironmentVariable(config.ApiKeyEnv);
 if (string.IsNullOrWhiteSpace(apiKey))
@@ -30,6 +42,11 @@ await using var boards = await BoardsClient.ConnectAsync(config.McpUrl, apiKey, 
 
 var me = await boards.GetMe(stop.Token);
 Log.Info($"Connected to {config.McpUrl} as {me.User.DisplayName} ({me.User.Id}), organization {me.Organization.Name}.");
+if (options.Check)
+{
+    return 0;
+}
+
 Log.Info($"Watching spaces: {string.Join(", ", config.Spaces.Keys)}.{(options.DryRun ? " Dry run - nothing is claimed." : $" Claude Code: {ClaudeExecutable.Resolve(config.ClaudePath)}")}");
 
 var runner = new Runner(boards, config);
@@ -457,7 +474,18 @@ sealed class ClaudeAgent : IDisposable
     }
 }
 
-/// <summary>The work-on-issue skill, embedded in the runner as a Claude Code plugin and written out once per start.</summary>
+static class RunnerVersion
+{
+    /// <summary>The version the release was built with (-p:Version), without the source revision suffix.</summary>
+    public static readonly string Value =
+        (typeof(RunnerVersion).Assembly
+            .GetCustomAttributes(typeof(System.Reflection.AssemblyInformationalVersionAttribute), false)
+            .OfType<System.Reflection.AssemblyInformationalVersionAttribute>()
+            .FirstOrDefault()?.InformationalVersion ?? "dev")
+        .Split('+')[0];
+}
+
+/// <summary>The work-on-issue skill, embedded in the runner as a Claude Code plugin and written out (again) on start.</summary>
 static class AgentPlugin
 {
     private const string Prefix = "plugin/";
@@ -467,7 +495,7 @@ static class AgentPlugin
     private static string Extract()
     {
         var assembly = typeof(AgentPlugin).Assembly;
-        var target = Path.Combine(Path.GetTempPath(), $"boards-agent-plugin-{Environment.ProcessId}");
+        var target = Path.Combine(Path.GetTempPath(), $"boards-agent-plugin-{RunnerVersion.Value}");
         foreach (var name in assembly.GetManifestResourceNames())
         {
             var relative = name.Replace('\\', '/');
@@ -581,13 +609,15 @@ static class Git
 }
 
 /// <summary>Command-line options.</summary>
-sealed record RunnerArgs(string ConfigPath, bool Once, bool DryRun)
+sealed record RunnerArgs(string ConfigPath, bool Once, bool DryRun, bool Check, bool Version)
 {
     public static RunnerArgs Parse(string[] args)
     {
         var configPath = "boards-agent.json";
         var once = false;
         var dryRun = false;
+        var check = false;
+        var version = false;
         for (var i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -601,12 +631,18 @@ sealed record RunnerArgs(string ConfigPath, bool Once, bool DryRun)
                 case "--dry-run":
                     dryRun = true;
                     break;
+                case "--check":
+                    check = true;
+                    break;
+                case "--version":
+                    version = true;
+                    break;
                 default:
-                    throw new ArgumentException($"Unknown argument: {args[i]}. Usage: boards-agent [--config <file>] [--once] [--dry-run]");
+                    throw new ArgumentException($"Unknown argument: {args[i]}. Usage: boards-agent [--config <file>] [--once] [--dry-run] [--check] [--version]");
             }
         }
 
-        return new RunnerArgs(configPath, once, dryRun);
+        return new RunnerArgs(configPath, once, dryRun, check, version);
     }
 }
 
