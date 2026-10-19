@@ -3,9 +3,13 @@
 // Run: dotnet run boards-agent.cs -- [--config boards-agent.json] [--once] [--dry-run] [--check] [--version]
 #:package ModelContextProtocol.Core@1.4.0
 #:property PublishAot=false
+#:property PublishTrimmed=true
+#:property JsonSerializerIsReflectionEnabledByDefault=false
 
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 
@@ -363,13 +367,13 @@ sealed class ClaudeAgent : IDisposable
     /// <summary>The boards MCP server for the agent. The API key stays in the environment: Claude Code expands ${VAR}.</summary>
     private static string McpConfig(RunnerConfig config)
     {
-        var server = new Dictionary<string, object>
+        var server = new JsonObject
         {
             ["type"] = "http",
             ["url"] = config.McpUrl,
-            ["headers"] = new Dictionary<string, string> { ["X-Api-Key"] = $"${{{config.ApiKeyEnv}}}" },
+            ["headers"] = new JsonObject { ["X-Api-Key"] = $"${{{config.ApiKeyEnv}}}" },
         };
-        return JsonSerializer.Serialize(new Dictionary<string, object> { ["mcpServers"] = new Dictionary<string, object> { ["boards"] = server } });
+        return new JsonObject { ["mcpServers"] = new JsonObject { ["boards"] = server } }.ToJsonString();
     }
 
     private static string Prompt(string spaceKey, AgentRunSummary run, Worktree worktree)
@@ -431,7 +435,7 @@ sealed class ClaudeAgent : IDisposable
             {
                 lock (_log)
                 {
-                    _log.WriteLine(JsonSerializer.Serialize(new { type = "stderr", text = line }));
+                    _log.WriteLine(new JsonObject { ["type"] = "stderr", ["text"] = line }.ToJsonString());
                 }
             }
         });
@@ -706,7 +710,7 @@ sealed record RunnerConfig
             throw new FileNotFoundException($"Config file {path} not found. Copy boards-agent.example.json to {path} and edit it.");
         }
 
-        var config = JsonSerializer.Deserialize<RunnerConfig>(File.ReadAllText(path), Json.Options)
+        var config = JsonSerializer.Deserialize(File.ReadAllText(path), RunnerJson.Default.RunnerConfig)
             ?? throw new InvalidOperationException($"{path} is empty.");
         if (config.Spaces.Count == 0)
         {
@@ -752,7 +756,7 @@ sealed class BoardsClient(McpClient client) : IAsyncDisposable
 
     public Task<MeInfo> GetMe(CancellationToken ct)
     {
-        return Call<MeInfo>("get_me", new Dictionary<string, object?>(), ct);
+        return Call("get_me", new Dictionary<string, object?>(), RunnerJson.Default.MeInfo, ct);
     }
 
     /// <summary>The user's own Ready runs in a space that aren't waiting for a blocker, oldest first.</summary>
@@ -761,17 +765,19 @@ sealed class BoardsClient(McpClient client) : IAsyncDisposable
         var result = new List<AgentRunSummary>();
         for (var page = 0; ; page++)
         {
-            var runs = await Call<AgentRunListPage>(
+            var runs = await Call(
                 "list_agent_runs",
                 new Dictionary<string, object?>
                 {
                     ["spaceKey"] = spaceKey,
                     ["state"] = "Ready",
-                    ["assigneeIds"] = new[] { userId },
+                    // The SDK serializes arguments with its own JSON context, which has string[] but not Guid[].
+                    ["assigneeIds"] = new[] { userId.ToString() },
                     ["excludeBlocked"] = true,
                     ["page"] = page,
                     ["count"] = PageSize,
                 },
+                RunnerJson.Default.AgentRunListPage,
                 ct);
             result.AddRange(runs.Runs);
             if (!runs.HasNextPage)
@@ -784,26 +790,27 @@ sealed class BoardsClient(McpClient client) : IAsyncDisposable
     /// <summary>False when the run was taken, cancelled or is blocked. Throws (403) when the issue isn't the user's.</summary>
     public Task<bool> ClaimAgentRun(long runId, CancellationToken ct)
     {
-        return Call<bool>("claim_agent_run", new Dictionary<string, object?> { ["runId"] = runId }, ct);
+        return Call("claim_agent_run", new Dictionary<string, object?> { ["runId"] = runId }, RunnerJson.Default.Boolean, ct);
     }
 
     /// <summary>False when the run isn't Working anymore (cancelled meanwhile).</summary>
     public Task<bool> FinishAgentRun(long runId, string state, string? reason, CancellationToken ct)
     {
-        return Call<bool>(
+        return Call(
             "finish_agent_run",
             new Dictionary<string, object?> { ["runId"] = runId, ["state"] = state, ["reason"] = reason },
+            RunnerJson.Default.Boolean,
             ct);
     }
 
     public Task<IReadOnlyList<EpicStatusSummary>> ListStatuses(string spaceKey, CancellationToken ct)
     {
-        return Call<IReadOnlyList<EpicStatusSummary>>("list_statuses", new Dictionary<string, object?> { ["spaceKey"] = spaceKey }, ct);
+        return Call("list_statuses", new Dictionary<string, object?> { ["spaceKey"] = spaceKey }, RunnerJson.Default.IReadOnlyListEpicStatusSummary, ct);
     }
 
     public Task<IssueDetail> GetIssue(string issueKey, CancellationToken ct)
     {
-        return Call<IssueDetail>("get_issue", new Dictionary<string, object?> { ["issueKey"] = issueKey }, ct);
+        return Call("get_issue", new Dictionary<string, object?> { ["issueKey"] = issueKey }, RunnerJson.Default.IssueDetail, ct);
     }
 
     public Task EditIssueStatus(string issueKey, long statusId, string? comment, CancellationToken ct)
@@ -819,10 +826,10 @@ sealed class BoardsClient(McpClient client) : IAsyncDisposable
         return CallVoid("create_comment", new Dictionary<string, object?> { ["issueKey"] = issueKey, ["text"] = text }, ct);
     }
 
-    private async Task<T> Call<T>(string tool, IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
+    private async Task<T> Call<T>(string tool, IReadOnlyDictionary<string, object?> arguments, JsonTypeInfo<T> result, CancellationToken ct)
     {
         var text = await CallVoid(tool, arguments, ct);
-        return JsonSerializer.Deserialize<T>(text, Json.Options)
+        return JsonSerializer.Deserialize(text, result)
             ?? throw new BoardsToolException(tool, "empty result");
     }
 
@@ -874,15 +881,15 @@ sealed record EpicStatusSummary(long EpicId, string EpicName, IReadOnlyList<Stat
 
 sealed record IssueDetail(string Key, string Title, string Status, long? StatusId, long? EpicId, int StatusCategoryId, AgentRunSummary? LatestAgentRun);
 
-static class Json
-{
-    public static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.Web)
-    {
-        ReadCommentHandling = JsonCommentHandling.Skip,
-        AllowTrailingCommas = true,
-        Converters = { new JsonStringEnumConverter() },
-    };
-}
+/// <summary>Source-generated JSON for everything the runner reads, so a trimmed build keeps working.</summary>
+[JsonSourceGenerationOptions(JsonSerializerDefaults.Web, ReadCommentHandling = JsonCommentHandling.Skip, AllowTrailingCommas = true)]
+[JsonSerializable(typeof(RunnerConfig))]
+[JsonSerializable(typeof(MeInfo))]
+[JsonSerializable(typeof(AgentRunListPage))]
+[JsonSerializable(typeof(IReadOnlyList<EpicStatusSummary>))]
+[JsonSerializable(typeof(IssueDetail))]
+[JsonSerializable(typeof(bool))]
+partial class RunnerJson : JsonSerializerContext;
 
 static class Paths
 {
