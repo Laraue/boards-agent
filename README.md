@@ -24,7 +24,7 @@ While a run is open, the issue is locked: it can't be edited or deleted. Status 
 - `git push`, `gh`, `WebFetch` and `WebSearch` are always denied.
 - Only the Boards MCP server is loaded (`--strict-mcp-config`), and only the repository's project settings are used (`--setting-sources project`).
 - The skill takes instructions only from the issue text and the assignee's own comments. Comments by anyone else are treated as untrusted data.
-- Your API key is read from an environment variable and never written to disk. The MCP config passes it to Claude Code as `${BOARDS_AGENT_API_KEY}`.
+- Your API key is issued by Boards when you click Allow during `boards-agent setup`, and kept in the macOS Keychain (the Secret Service on Linux). It's never shown or written to a file. Claude Code gets it through its environment: the MCP config refers to it as `${BOARDS_AGENT_API_KEY}`.
 
 ## Install
 
@@ -33,11 +33,19 @@ Download the archive for your system from [Releases](https://github.com/Laraue/b
 ```bash
 tar -xzf boards-agent-v0.1.0-osx-arm64.tar.gz
 cd boards-agent
-cp boards-agent.example.json boards-agent.json   # then map your spaces to local checkouts
-export BOARDS_AGENT_API_KEY=<your key>
-./boards-agent --check
+./boards-agent setup
 ./boards-agent
 ```
+
+## Setup
+
+Run `boards-agent setup`, ideally from inside the repository you want the agent to work in. It:
+
+1. Opens Boards in your browser. Check the code, pick the organization and click **Allow**. Boards creates an API key named "Claude Code agent (your machine)" and hands it to the runner, which keeps it in the Keychain. You can revoke the key any time under Account -> API keys.
+2. Asks which space's issues are worked on in which local repository, offering the one you ran it in. New branches start from the remote's default branch (e.g. `origin/main`).
+3. Finds Claude Code and runs `claude auth login` if it isn't signed in.
+
+The answers go to `~/.config/boards-agent/config.json` (`%APPDATA%\boards-agent\config.json` on Windows), which the runner reads by default. Running setup again keeps what's there. Use `--no-browser` to just print the link, e.g. over SSH. `--config <file>` points both setup and the runner at another config file; `boards-agent.example.json` lists every setting. Setting `BOARDS_AGENT_API_KEY` overrides the stored key.
 
 The macOS binaries aren't notarized yet. If macOS refuses to open the binary, allow it in System Settings -> Privacy & Security, or run `xattr -d com.apple.quarantine boards-agent`.
 
@@ -51,14 +59,12 @@ Push a `v*` tag (e.g. `v0.1.0`; `v0.1.0-beta.1` makes a pre-release). The Releas
 
 You need the .NET 10 SDK and Claude Code (on `PATH`, or the copy bundled with the Claude desktop app).
 
-1. Create an API key in Boards: Account -> API keys. A name like "Claude Code agent" makes the issue history read "you via API key Claude Code agent".
-2. Copy `boards-agent.example.json` to `boards-agent.json` and map your spaces to local checkouts.
-3. Run:
-
 ```bash
-export BOARDS_AGENT_API_KEY=<your key>
+dotnet run boards-agent.cs -- setup
 dotnet run boards-agent.cs
 ```
+
+Against a local Boards, point setup at it: `--web-url http://localhost:3000 --api-url http://localhost:5200 --mcp-url http://localhost:5202/mcp`.
 
 ## License
 

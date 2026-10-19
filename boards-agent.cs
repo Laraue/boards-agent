@@ -1,6 +1,6 @@
 #!/usr/bin/env dotnet
 // boards-agent: picks up Laraue Boards issues handed to the agent and works on them with Claude Code.
-// Run: dotnet run boards-agent.cs -- [--config boards-agent.json] [--once] [--dry-run] [--check] [--version]
+// Run: dotnet run boards-agent.cs -- [setup] [--config <file>] [--once] [--dry-run] [--check] [--version]
 #:package ModelContextProtocol.Core@1.4.0
 #:property PublishAot=false
 #:property PublishTrimmed=true
@@ -20,27 +20,40 @@ if (options.Version)
     return 0;
 }
 
-var config = RunnerConfig.Load(options.ConfigPath);
-if (options.Check)
-{
-    Console.WriteLine($"boards-agent {RunnerVersion.Value}");
-    Console.WriteLine($"Claude Code: {ClaudeExecutable.Resolve(config.ClaudePath)}");
-    Console.WriteLine($"Agent skill: {AgentPlugin.Directory.Value}");
-}
-
-var apiKey = Environment.GetEnvironmentVariable(config.ApiKeyEnv);
-if (string.IsNullOrWhiteSpace(apiKey))
-{
-    Log.Error($"Set the {config.ApiKeyEnv} environment variable to a Boards API key.");
-    return 1;
-}
-
 using var stop = new CancellationTokenSource();
 Console.CancelKeyPress += (_, e) =>
 {
     e.Cancel = true;
     stop.Cancel();
 };
+
+if (options.Command == RunnerArgs.SetupCommand)
+{
+    try
+    {
+        return await Setup.RunAsync(options, stop.Token);
+    }
+    catch (OperationCanceledException) when (stop.IsCancellationRequested)
+    {
+        return 1;
+    }
+}
+
+var config = RunnerConfig.Load(options.ConfigPath);
+if (options.Check)
+{
+    Console.WriteLine($"boards-agent {RunnerVersion.Value}");
+    Console.WriteLine($"Config: {options.ConfigPath}");
+    Console.WriteLine($"Claude Code: {ClaudeExecutable.Resolve(config.ClaudePath)}");
+    Console.WriteLine($"Agent skill: {AgentPlugin.Directory.Value}");
+}
+
+var apiKey = ApiKeySource.Resolve(config);
+if (apiKey is null)
+{
+    Log.Error("No Boards API key: run `boards-agent setup` to sign in.");
+    return 1;
+}
 
 await using var boards = await BoardsClient.ConnectAsync(config.McpUrl, apiKey, stop.Token);
 
@@ -53,7 +66,7 @@ if (options.Check)
 
 Log.Info($"Watching spaces: {string.Join(", ", config.Spaces.Keys)}.{(options.DryRun ? " Dry run - nothing is claimed." : $" Claude Code: {ClaudeExecutable.Resolve(config.ClaudePath)}")}");
 
-var runner = new Runner(boards, config);
+var runner = new Runner(boards, config, apiKey);
 try
 {
     while (!stop.IsCancellationRequested)
@@ -98,7 +111,7 @@ Log.Info("Stopped.");
 return 0;
 
 /// <summary>Takes one run from claim to finish.</summary>
-sealed class Runner(BoardsClient boards, RunnerConfig config)
+sealed class Runner(BoardsClient boards, RunnerConfig config, string apiKey)
 {
     private const int MaxReasonLength = 4096;
 
@@ -146,7 +159,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config)
     private async Task Work(string spaceKey, AgentRunSummary run, Worktree worktree, CancellationToken ct)
     {
         var logPath = Path.Combine(config.WorktreeFolder, $"{run.IssueKey}.run-{run.Id}.jsonl");
-        using var agent = ClaudeAgent.Start(config, spaceKey, run, worktree, logPath);
+        using var agent = ClaudeAgent.Start(config, apiKey, spaceKey, run, worktree, logPath);
         Log.Info($"{run.IssueKey}: Claude Code started (pid {agent.ProcessId}), log {logPath}.");
 
         var deadline = DateTime.UtcNow.AddMinutes(config.TimeoutMinutes);
@@ -316,7 +329,7 @@ sealed class ClaudeAgent : IDisposable
 
     public int ExitCode => _process.ExitCode;
 
-    public static ClaudeAgent Start(RunnerConfig config, string spaceKey, AgentRunSummary run, Worktree worktree, string logPath)
+    public static ClaudeAgent Start(RunnerConfig config, string apiKey, string spaceKey, AgentRunSummary run, Worktree worktree, string logPath)
     {
         var mcpConfigPath = Path.Combine(config.WorktreeFolder, $"{run.IssueKey}.mcp.json");
         File.WriteAllText(mcpConfigPath, McpConfig(config));
@@ -353,11 +366,10 @@ sealed class ClaudeAgent : IDisposable
             info.ArgumentList.Add(budget.ToString(System.Globalization.CultureInfo.InvariantCulture));
         }
 
-        // A runner started from inside a Claude Code session must not hand that session's state to the agent.
-        foreach (var name in info.Environment.Keys.Where(x => x == "CLAUDECODE" || x.StartsWith("CLAUDE_CODE_") || x.StartsWith("CLAUDE_AGENT_SDK_")).ToList())
-        {
-            info.Environment.Remove(name);
-        }
+        ClaudeExecutable.RemoveSessionEnvironment(info);
+
+        // The MCP config refers to the key as ${VAR}, so it reaches Claude Code only through its environment.
+        info.Environment[config.ApiKeyEnv] = apiKey;
 
         var process = System.Diagnostics.Process.Start(info)!;
         process.StandardInput.Close();
@@ -551,6 +563,44 @@ static class ClaudeExecutable
             : null;
         return newest ?? throw new FileNotFoundException("Claude Code wasn't found: put claude on PATH or set claudePath in the config.");
     }
+
+    /// <summary>A runner started from inside a Claude Code session must not hand that session's state to the Claude it starts.</summary>
+    public static void RemoveSessionEnvironment(System.Diagnostics.ProcessStartInfo info)
+    {
+        foreach (var name in info.Environment.Keys.Where(x => x == "CLAUDECODE" || x.StartsWith("CLAUDE_CODE_") || x.StartsWith("CLAUDE_AGENT_SDK_")).ToList())
+        {
+            info.Environment.Remove(name);
+        }
+    }
+
+    /// <summary>Whether Claude Code is signed in, by `claude auth status`.</summary>
+    public static bool IsSignedIn(string executable)
+    {
+        var info = new System.Diagnostics.ProcessStartInfo(executable);
+        info.ArgumentList.Add("auth");
+        info.ArgumentList.Add("status");
+        RemoveSessionEnvironment(info);
+        var result = Shell.Run(info);
+        try
+        {
+            return JsonSerializer.Deserialize(result.Output, RunnerJson.Default.ClaudeAuthStatus)?.LoggedIn == true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>`claude auth login` in this terminal - the person signs in in the browser it opens.</summary>
+    public static void SignIn(string executable)
+    {
+        var info = new System.Diagnostics.ProcessStartInfo(executable);
+        info.ArgumentList.Add("auth");
+        info.ArgumentList.Add("login");
+        RemoveSessionEnvironment(info);
+        using var process = System.Diagnostics.Process.Start(info)!;
+        process.WaitForExit();
+    }
 }
 
 sealed record Worktree(string Path, string Branch, string BaseRef);
@@ -584,50 +634,133 @@ static class Git
         return new Worktree(path, branch, baseRef);
     }
 
+    /// <summary>The top folder of the git checkout <paramref name="folder"/> is in, or null when it isn't in one.</summary>
+    public static string? FindCheckout(string folder)
+    {
+        if (!Directory.Exists(folder))
+        {
+            return null;
+        }
+
+        var result = Run(folder, ["rev-parse", "--show-toplevel"], throwOnError: false);
+        return result.ExitCode == 0 ? result.Output.Trim() : null;
+    }
+
+    /// <summary>What new branches should start from: the remote's default branch (e.g. origin/main), else HEAD.</summary>
+    public static string DefaultBaseRef(string repo)
+    {
+        var result = Run(repo, ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], throwOnError: false);
+        return result.ExitCode == 0 && result.Output.Trim() is { Length: > 0 } remoteHead ? remoteHead : "HEAD";
+    }
+
     private static ProcessResult Run(string workingDirectory, string[] arguments, bool throwOnError = true)
     {
-        var info = new System.Diagnostics.ProcessStartInfo("git")
-        {
-            WorkingDirectory = workingDirectory,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-        };
+        var info = new System.Diagnostics.ProcessStartInfo("git") { WorkingDirectory = workingDirectory };
         foreach (var argument in arguments)
         {
             info.ArgumentList.Add(argument);
         }
 
-        using var process = System.Diagnostics.Process.Start(info)!;
-        var output = process.StandardOutput.ReadToEnd();
-        var error = process.StandardError.ReadToEnd();
-        process.WaitForExit();
-        if (throwOnError && process.ExitCode != 0)
+        var result = Shell.Run(info);
+        if (throwOnError && result.ExitCode != 0)
         {
-            throw new InvalidOperationException($"git {string.Join(' ', arguments)} failed: {error.Trim()}");
+            throw new InvalidOperationException($"git {string.Join(' ', arguments)} failed: {result.Error.Trim()}");
         }
 
-        return new ProcessResult(process.ExitCode, output);
+        return result;
     }
-
-    private sealed record ProcessResult(int ExitCode, string Output);
 }
 
-/// <summary>Command-line options.</summary>
-sealed record RunnerArgs(string ConfigPath, bool Once, bool DryRun, bool Check, bool Version)
+sealed record ProcessResult(int ExitCode, string Output, string Error);
+
+static class Shell
 {
+    /// <summary>Runs a process to the end, capturing its output; <paramref name="input"/> goes to its stdin.</summary>
+    public static ProcessResult Run(System.Diagnostics.ProcessStartInfo info, string? input = null)
+    {
+        info.RedirectStandardOutput = true;
+        info.RedirectStandardError = true;
+        info.RedirectStandardInput = true;
+        using var process = System.Diagnostics.Process.Start(info)!;
+        if (input is not null)
+        {
+            process.StandardInput.Write(input);
+        }
+
+        process.StandardInput.Close();
+        var error = process.StandardError.ReadToEndAsync();
+        var output = process.StandardOutput.ReadToEnd();
+        process.WaitForExit();
+        return new ProcessResult(process.ExitCode, output, error.Result);
+    }
+
+    public static ProcessResult Run(string file, params string[] arguments)
+    {
+        var info = new System.Diagnostics.ProcessStartInfo(file);
+        foreach (var argument in arguments)
+        {
+            info.ArgumentList.Add(argument);
+        }
+
+        return Run(info);
+    }
+}
+
+/// <summary>
+/// Command-line options. <see cref="WebUrl"/>, <see cref="ApiUrl"/> and <see cref="McpUrl"/> point setup at another
+/// Boards than production, e.g. a local one.
+/// </summary>
+sealed record RunnerArgs(
+    string? Command,
+    string ConfigPath,
+    bool Once,
+    bool DryRun,
+    bool Check,
+    bool Version,
+    string? WebUrl,
+    string? ApiUrl,
+    string? McpUrl,
+    bool NoBrowser)
+{
+    public const string SetupCommand = "setup";
+
+    private const string Usage =
+        "Usage: boards-agent [setup] [--config <file>] [--once] [--dry-run] [--check] [--version]\n" +
+        "       boards-agent setup [--no-browser] [--web-url <url>] [--api-url <url>] [--mcp-url <url>]";
+
     public static RunnerArgs Parse(string[] args)
     {
-        var configPath = "boards-agent.json";
+        string? command = null;
+        var configPath = RunnerConfig.DefaultPath;
         var once = false;
         var dryRun = false;
         var check = false;
         var version = false;
+        string? webUrl = null;
+        string? apiUrl = null;
+        string? mcpUrl = null;
+        var noBrowser = false;
         for (var i = 0; i < args.Length; i++)
         {
             switch (args[i])
             {
+                case SetupCommand when i == 0:
+                    command = SetupCommand;
+                    break;
                 case "--config" when i + 1 < args.Length:
-                    configPath = args[++i];
+                    configPath = Paths.Expand(args[++i]);
+                    break;
+                case "--web-url" when i + 1 < args.Length:
+                    webUrl = args[++i];
+                    break;
+                case "--api-url" when i + 1 < args.Length:
+                    apiUrl = args[++i];
+                    break;
+                case "--mcp-url" when i + 1 < args.Length:
+                    mcpUrl = args[++i];
+                    break;
+                case "--no-browser":
+                    noBrowser = true;
                     break;
                 case "--once":
                     once = true;
@@ -642,21 +775,38 @@ sealed record RunnerArgs(string ConfigPath, bool Once, bool DryRun, bool Check, 
                     version = true;
                     break;
                 default:
-                    throw new ArgumentException($"Unknown argument: {args[i]}. Usage: boards-agent [--config <file>] [--once] [--dry-run] [--check] [--version]");
+                    throw new ArgumentException($"Unknown argument: {args[i]}.\n{Usage}");
             }
         }
 
-        return new RunnerArgs(configPath, once, dryRun, check, version);
+        return new RunnerArgs(command, configPath, once, dryRun, check, version, webUrl, apiUrl, mcpUrl, noBrowser);
     }
 }
 
-/// <summary>The runner's settings, read from a JSON file. The API key itself is never stored there.</summary>
+/// <summary>
+/// The runner's settings, written by `boards-agent setup` to <see cref="DefaultPath"/>. The API key itself is never
+/// stored there - it's in the OS credential store (<see cref="CredentialStore"/>).
+/// </summary>
 sealed record RunnerConfig
 {
-    /// <summary>The Boards MCP endpoint.</summary>
-    public string McpUrl { get; init; } = "http://localhost:5202/mcp";
+    /// <summary>The Boards web app, where setup sends the person to allow the sign-in.</summary>
+    public string WebUrl { get; init; } = "https://boards.laraue.com";
 
-    /// <summary>The environment variable holding the API key of the user the runner works for.</summary>
+    /// <summary>The Boards web API, which issues the API key at setup.</summary>
+    public string ApiUrl { get; init; } = "https://boards.laraue.com/boards-api";
+
+    /// <summary>The Boards MCP endpoint.</summary>
+    public string McpUrl { get; init; } = "https://boards.laraue.com/boards-mcp/mcp";
+
+    /// <summary>The organization the API key belongs to - its credential store entry is named after it.</summary>
+    public long? OrganizationId { get; init; }
+
+    public string? OrganizationName { get; init; }
+
+    /// <summary>
+    /// An environment variable that, when set, overrides the stored key (e.g. on a machine without a credential
+    /// store). Also how Claude Code receives the key: the runner sets it for the Claude it starts.
+    /// </summary>
     public string ApiKeyEnv { get; init; } = "BOARDS_AGENT_API_KEY";
 
     /// <summary>Space key -> the local repository its issues are worked on in. Only these spaces are polled.</summary>
@@ -703,25 +853,53 @@ sealed record RunnerConfig
     /// <summary>How often Ready runs are polled.</summary>
     public int PollIntervalSeconds { get; init; } = 60;
 
+    /// <summary>~/.config/boards-agent/config.json ($XDG_CONFIG_HOME if set), or %APPDATA%\\boards-agent\\config.json on Windows.</summary>
+    public static string DefaultPath
+    {
+        get
+        {
+            var folder = OperatingSystem.IsWindows()
+                ? Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData)
+                : Environment.GetEnvironmentVariable("XDG_CONFIG_HOME") is { Length: > 0 } xdg
+                    ? xdg
+                    : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".config");
+            return Path.Combine(folder, "boards-agent", "config.json");
+        }
+    }
+
     public static RunnerConfig Load(string path)
+    {
+        var config = TryLoad(path)
+            ?? throw new FileNotFoundException($"No config at {path}. Run `boards-agent setup` first.");
+        if (config.Spaces.Count == 0)
+        {
+            throw new InvalidOperationException($"{path}: no space is mapped to a local repository. Run `boards-agent setup`.");
+        }
+
+        return config;
+    }
+
+    /// <summary>The config at <paramref name="path"/> with its paths expanded, or null when there's none.</summary>
+    public static RunnerConfig? TryLoad(string path)
     {
         if (!File.Exists(path))
         {
-            throw new FileNotFoundException($"Config file {path} not found. Copy boards-agent.example.json to {path} and edit it.");
+            return null;
         }
 
         var config = JsonSerializer.Deserialize(File.ReadAllText(path), RunnerJson.Default.RunnerConfig)
             ?? throw new InvalidOperationException($"{path} is empty.");
-        if (config.Spaces.Count == 0)
-        {
-            throw new InvalidOperationException($"{path}: map at least one space key to a local repository in \"spaces\".");
-        }
-
         return config with
         {
             Spaces = config.Spaces.ToDictionary(x => x.Key, x => x.Value with { Repo = Paths.Expand(x.Value.Repo) }),
             WorktreeFolder = Paths.Expand(config.WorktreeFolder),
         };
+    }
+
+    public void Save(string path)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, JsonSerializer.Serialize(this, RunnerJson.Default.RunnerConfig));
     }
 }
 
@@ -757,6 +935,11 @@ sealed class BoardsClient(McpClient client) : IAsyncDisposable
     public Task<MeInfo> GetMe(CancellationToken ct)
     {
         return Call("get_me", new Dictionary<string, object?>(), RunnerJson.Default.MeInfo, ct);
+    }
+
+    public Task<IReadOnlyList<SpaceSummary>> ListSpaces(CancellationToken ct)
+    {
+        return Call("list_spaces", new Dictionary<string, object?>(), RunnerJson.Default.IReadOnlyListSpaceSummary, ct);
     }
 
     /// <summary>The user's own Ready runs in a space that aren't waiting for a blocker, oldest first.</summary>
@@ -877,19 +1060,426 @@ sealed record AgentRunSummary(
 
 sealed record StatusSummary(long Id, string Name, int CategoryId, string Category);
 
+sealed record SpaceSummary(string Key, string Name, bool CanCreateIssue);
+
+/// <summary>`claude auth status`'s answer - only what setup reads.</summary>
+sealed record ClaudeAuthStatus(bool LoggedIn);
+
 sealed record EpicStatusSummary(long EpicId, string EpicName, IReadOnlyList<StatusSummary> Statuses);
 
 sealed record IssueDetail(string Key, string Title, string Status, long? StatusId, long? EpicId, int StatusCategoryId, AgentRunSummary? LatestAgentRun);
 
 /// <summary>Source-generated JSON for everything the runner reads, so a trimmed build keeps working.</summary>
-[JsonSourceGenerationOptions(JsonSerializerDefaults.Web, ReadCommentHandling = JsonCommentHandling.Skip, AllowTrailingCommas = true)]
+[JsonSourceGenerationOptions(
+    JsonSerializerDefaults.Web,
+    ReadCommentHandling = JsonCommentHandling.Skip,
+    AllowTrailingCommas = true,
+    WriteIndented = true,
+    DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
 [JsonSerializable(typeof(RunnerConfig))]
+[JsonSerializable(typeof(IReadOnlyList<SpaceSummary>))]
+[JsonSerializable(typeof(ClaudeAuthStatus))]
+[JsonSerializable(typeof(AgentSignInStart))]
+[JsonSerializable(typeof(AgentSignInPoll))]
 [JsonSerializable(typeof(MeInfo))]
 [JsonSerializable(typeof(AgentRunListPage))]
 [JsonSerializable(typeof(IReadOnlyList<EpicStatusSummary>))]
 [JsonSerializable(typeof(IssueDetail))]
 [JsonSerializable(typeof(bool))]
 partial class RunnerJson : JsonSerializerContext;
+
+/// <summary>Where the runner's API key comes from: the environment variable when set, else the credential store.</summary>
+static class ApiKeySource
+{
+    public static string? Resolve(RunnerConfig config)
+    {
+        if (Environment.GetEnvironmentVariable(config.ApiKeyEnv) is { Length: > 0 } fromEnvironment)
+        {
+            return fromEnvironment;
+        }
+
+        return config.OrganizationId is { } organizationId
+            ? CredentialStore.Load(CredentialStore.Account(organizationId))
+            : null;
+    }
+}
+
+/// <summary>
+/// The API key in the OS credential store: the macOS Keychain (security), or the Secret Service on Linux (secret-tool).
+/// One entry per organization. The key never goes on a command line - it's passed on stdin - and never to a file.
+/// </summary>
+static class CredentialStore
+{
+    private const string Service = "boards-agent";
+
+    public static string Account(long organizationId)
+    {
+        return $"organization-{organizationId}";
+    }
+
+    public static void Save(string account, string label, string secret)
+    {
+        ProcessResult result;
+        if (OperatingSystem.IsMacOS())
+        {
+            // security's interactive mode reads the command from stdin, so the key isn't visible in the process list.
+            // -A lets the runner read it back after an upgrade changes its binary, without a Keychain prompt.
+            var safeLabel = label.Replace("\"", "").Replace("\\", "");
+            result = Shell.Run(
+                new System.Diagnostics.ProcessStartInfo("/usr/bin/security", "-i"),
+                $"add-generic-password -U -A -s {Service} -a {account} -l \"{safeLabel}\" -w {secret}\n");
+        }
+        else if (OperatingSystem.IsLinux())
+        {
+            var info = new System.Diagnostics.ProcessStartInfo("secret-tool");
+            foreach (var argument in new[] { "store", $"--label={label}", "service", Service, "account", account })
+            {
+                info.ArgumentList.Add(argument);
+            }
+
+            result = Shell.Run(info, secret);
+        }
+        else
+        {
+            throw new PlatformNotSupportedException(
+                "Storing the key isn't supported on this system yet. Set the BOARDS_AGENT_API_KEY environment variable instead.");
+        }
+
+        if (result.ExitCode != 0)
+        {
+            throw new InvalidOperationException($"Couldn't save the API key in the credential store: {result.Error.Trim()}");
+        }
+    }
+
+    /// <summary>The stored key, or null when there's none (or no credential store).</summary>
+    public static string? Load(string account)
+    {
+        ProcessResult result;
+        if (OperatingSystem.IsMacOS())
+        {
+            result = Shell.Run("/usr/bin/security", "find-generic-password", "-s", Service, "-a", account, "-w");
+        }
+        else if (OperatingSystem.IsLinux())
+        {
+            result = Shell.Run("secret-tool", "lookup", "service", Service, "account", account);
+        }
+        else
+        {
+            return null;
+        }
+
+        return result.ExitCode == 0 && result.Output.Trim() is { Length: > 0 } secret ? secret : null;
+    }
+}
+
+sealed record AgentSignInStart(string DeviceCode, string UserCode, string VerificationPath, DateTime ExpiresAt, int IntervalSeconds);
+
+sealed record AgentSignInPoll(string Outcome, string? ApiKey, long? OrganizationId, string? OrganizationName, Guid? UserId);
+
+sealed record SignedIn(string ApiKey, long OrganizationId, string OrganizationName);
+
+/// <summary>
+/// "Connect this machine": the runner asks Boards for a sign-in, the person allows it in the browser for one of their
+/// organizations, and the runner polls until Boards hands it the organization's new API key.
+/// </summary>
+static class BoardsSignIn
+{
+    /// <summary>Boards adds the machine name to the key's name, which allows 44 characters for it.</summary>
+    private const int MaxMachineNameLength = 44;
+
+    /// <param name="openBrowser">False prints the link only, e.g. over SSH, to open it on another device.</param>
+    public static async Task<SignedIn?> RunAsync(RunnerConfig config, bool openBrowser, CancellationToken ct)
+    {
+        using var http = new HttpClient { BaseAddress = new Uri(config.ApiUrl.TrimEnd('/') + "/") };
+
+        var start = await PostAsync(
+            http,
+            "api/agent-sign-in",
+            new JsonObject { ["machineName"] = MachineName() },
+            RunnerJson.Default.AgentSignInStart,
+            ct);
+
+        var url = config.WebUrl.TrimEnd('/') + start.VerificationPath;
+        Console.WriteLine();
+        if (openBrowser)
+        {
+            Console.WriteLine($"Opening Boards in your browser to connect this machine. Your code: {start.UserCode}");
+            Console.WriteLine($"If the browser didn't open, go to {url}");
+            OpenBrowser(url);
+        }
+        else
+        {
+            Console.WriteLine($"To connect this machine, open {url} and check that it shows the code {start.UserCode}.");
+        }
+
+        Console.WriteLine("Waiting for you to click Allow...");
+
+        var interval = TimeSpan.FromSeconds(Math.Max(start.IntervalSeconds, 1));
+        while (true)
+        {
+            await Task.Delay(interval, ct);
+            var poll = await PostAsync(
+                http,
+                "api/agent-sign-in/token",
+                new JsonObject { ["deviceCode"] = start.DeviceCode },
+                RunnerJson.Default.AgentSignInPoll,
+                ct);
+
+            switch (poll.Outcome)
+            {
+                case "Approved" when poll is { ApiKey: { } apiKey, OrganizationId: { } organizationId }:
+                    return new SignedIn(apiKey, organizationId, poll.OrganizationName ?? organizationId.ToString());
+                case "SlowDown":
+                    interval += TimeSpan.FromSeconds(5);
+                    break;
+                case "Denied":
+                    Console.WriteLine("You denied the sign-in in the browser.");
+                    return null;
+                case "Expired":
+                    Console.WriteLine("The sign-in timed out. Run `boards-agent setup` again.");
+                    return null;
+            }
+        }
+    }
+
+    private static string MachineName()
+    {
+        var name = Environment.MachineName;
+        if (name.EndsWith(".local", StringComparison.OrdinalIgnoreCase))
+        {
+            name = name[..^".local".Length];
+        }
+
+        return name.Length > MaxMachineNameLength ? name[..MaxMachineNameLength] : name;
+    }
+
+    private static void OpenBrowser(string url)
+    {
+        try
+        {
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(url) { UseShellExecute = true })?.Dispose();
+        }
+        catch (Exception)
+        {
+            // The URL is printed too; a machine without a browser (e.g. over SSH) opens it elsewhere.
+        }
+    }
+
+    private static async Task<T> PostAsync<T>(HttpClient http, string path, JsonObject body, JsonTypeInfo<T> result, CancellationToken ct)
+    {
+        using var content = new StringContent(body.ToJsonString(), System.Text.Encoding.UTF8, "application/json");
+        using var response = await http.PostAsync(path, content, ct);
+        var text = await response.Content.ReadAsStringAsync(ct);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw new InvalidOperationException($"Boards answered {(int)response.StatusCode} to {path}: {text}");
+        }
+
+        return JsonSerializer.Deserialize(text, result)
+            ?? throw new InvalidOperationException($"Boards gave an empty answer to {path}.");
+    }
+}
+
+/// <summary>
+/// `boards-agent setup`: signs this machine in to Boards (the key goes to the credential store), maps spaces to local
+/// repositories, and makes sure Claude Code is signed in. Writes the config; running it again keeps what's there.
+/// </summary>
+static class Setup
+{
+    public static async Task<int> RunAsync(RunnerArgs options, CancellationToken ct)
+    {
+        var config = RunnerConfig.TryLoad(options.ConfigPath) ?? new RunnerConfig();
+        config = config with
+        {
+            WebUrl = options.WebUrl ?? config.WebUrl,
+            ApiUrl = options.ApiUrl ?? config.ApiUrl,
+            McpUrl = options.McpUrl ?? config.McpUrl,
+        };
+
+        Console.WriteLine($"boards-agent {RunnerVersion.Value} setup");
+
+        // 1. Boards: reuse a stored key that still works, unless the person wants another organization.
+        var apiKey = ApiKeySource.Resolve(config);
+        MeInfo? me = apiKey is null ? null : await TryGetMe(config.McpUrl, apiKey, ct);
+        if (me is not null && !Confirm($"Signed in to Boards as {me.User.DisplayName}, organization {me.Organization.Name}. Keep it?", defaultYes: true))
+        {
+            me = null;
+        }
+
+        if (me is null)
+        {
+            var signedIn = await BoardsSignIn.RunAsync(config, !options.NoBrowser, ct);
+            if (signedIn is null)
+            {
+                return 1;
+            }
+
+            CredentialStore.Save(
+                CredentialStore.Account(signedIn.OrganizationId),
+                $"Boards agent - {signedIn.OrganizationName}",
+                signedIn.ApiKey);
+            apiKey = signedIn.ApiKey;
+            me = await TryGetMe(config.McpUrl, apiKey, ct)
+                ?? throw new InvalidOperationException($"The new API key doesn't work with {config.McpUrl}.");
+
+            // Spaces belong to an organization: another organization starts over.
+            if (config.OrganizationId != signedIn.OrganizationId)
+            {
+                config = config with { Spaces = [] };
+            }
+
+            config = config with { OrganizationId = signedIn.OrganizationId, OrganizationName = signedIn.OrganizationName };
+            Console.WriteLine($"Signed in as {me.User.DisplayName}, organization {me.Organization.Name}. The API key is in your {CredentialStoreName}.");
+        }
+
+        // 2. Which local repository each space's issues are worked on in.
+        await using (var boards = await BoardsClient.ConnectAsync(config.McpUrl, apiKey!, ct))
+        {
+            var spaces = await boards.ListSpaces(ct);
+            config = config with { Spaces = MapSpaces(spaces, config.Spaces) };
+        }
+
+        config.Save(options.ConfigPath);
+        Console.WriteLine($"Saved {options.ConfigPath}.");
+
+        // 3. Claude Code.
+        string claude;
+        try
+        {
+            claude = ClaudeExecutable.Resolve(config.ClaudePath);
+        }
+        catch (FileNotFoundException)
+        {
+            Console.WriteLine("Claude Code isn't installed. Install it (https://claude.com/claude-code), then run `boards-agent setup` again.");
+            return 1;
+        }
+
+        if (!ClaudeExecutable.IsSignedIn(claude))
+        {
+            Console.WriteLine("Claude Code isn't signed in. Starting `claude auth login`...");
+            ClaudeExecutable.SignIn(claude);
+            if (!ClaudeExecutable.IsSignedIn(claude))
+            {
+                Console.WriteLine("Claude Code still isn't signed in. Run `boards-agent setup` again once it is.");
+                return 1;
+            }
+        }
+
+        Console.WriteLine($"Claude Code: {claude} (signed in).");
+        Console.WriteLine();
+        Console.WriteLine(config.Spaces.Count == 0
+            ? "No space is mapped to a repository yet, so there's nothing to watch. Run `boards-agent setup` again to map one."
+            : $"Done. Watching {string.Join(", ", config.Spaces.Keys)}. Start the runner with `boards-agent`, then hand an issue to the agent in Boards.");
+        return 0;
+    }
+
+    private static string CredentialStoreName => OperatingSystem.IsMacOS() ? "Keychain" : "credential store";
+
+    /// <summary>The user the key signs in as, or null when it doesn't work (revoked, or for another Boards).</summary>
+    private static async Task<MeInfo?> TryGetMe(string mcpUrl, string apiKey, CancellationToken ct)
+    {
+        try
+        {
+            await using var boards = await BoardsClient.ConnectAsync(mcpUrl, apiKey, ct);
+            return await boards.GetMe(ct);
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Asks which space goes with which repository, starting with the git checkout setup runs in. Existing mappings stay.
+    /// </summary>
+    private static Dictionary<string, SpaceConfig> MapSpaces(IReadOnlyList<SpaceSummary> spaces, Dictionary<string, SpaceConfig> existing)
+    {
+        var mapped = existing
+            .Where(x => spaces.Any(space => space.Key == x.Key))
+            .ToDictionary(x => x.Key, x => x.Value);
+        if (spaces.Count == 0)
+        {
+            Console.WriteLine("You can't read any space in this organization yet.");
+            return mapped;
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("Spaces:");
+        for (var i = 0; i < spaces.Count; i++)
+        {
+            var current = mapped.TryGetValue(spaces[i].Key, out var space) ? $" -> {space.Repo}" : "";
+            Console.WriteLine($"  {i + 1}. {spaces[i].Key} {spaces[i].Name}{current}");
+        }
+
+        var here = Git.FindCheckout(Environment.CurrentDirectory);
+        if (here is not null && !mapped.Values.Any(x => x.Repo == here))
+        {
+            var space = AskSpace(spaces, $"Which space's issues should be worked on in {here}? Number, or Enter to skip:");
+            if (space is not null)
+            {
+                mapped[space.Key] = new SpaceConfig { Repo = here, BaseRef = Git.DefaultBaseRef(here) };
+            }
+        }
+
+        while (AskSpace(spaces, mapped.Count == 0 ? "Map a space to a repository? Number, or Enter to finish:" : "Map another space? Number, or Enter to finish:") is { } space)
+        {
+            var folder = Ask($"Folder of the {space.Key} repository (a git checkout):");
+            var repo = folder.Length == 0 ? null : Git.FindCheckout(Paths.Expand(folder));
+            if (repo is null)
+            {
+                Console.WriteLine($"{folder} isn't a git checkout.");
+                continue;
+            }
+
+            mapped[space.Key] = new SpaceConfig { Repo = repo, BaseRef = Git.DefaultBaseRef(repo) };
+        }
+
+        foreach (var (key, space) in mapped)
+        {
+            Console.WriteLine($"  {key} -> {space.Repo} (branches from {space.BaseRef})");
+        }
+
+        return mapped;
+    }
+
+    private static SpaceSummary? AskSpace(IReadOnlyList<SpaceSummary> spaces, string question)
+    {
+        while (true)
+        {
+            var answer = Ask(question);
+            if (answer.Length == 0)
+            {
+                return null;
+            }
+
+            if (int.TryParse(answer, out var number) && number >= 1 && number <= spaces.Count)
+            {
+                return spaces[number - 1];
+            }
+
+            var byKey = spaces.FirstOrDefault(x => string.Equals(x.Key, answer, StringComparison.OrdinalIgnoreCase));
+            if (byKey is not null)
+            {
+                return byKey;
+            }
+
+            Console.WriteLine($"Enter a number from 1 to {spaces.Count}.");
+        }
+    }
+
+    private static bool Confirm(string question, bool defaultYes)
+    {
+        var answer = Ask($"{question} [{(defaultYes ? "Y/n" : "y/N")}]");
+        return answer.Length == 0 ? defaultYes : answer.StartsWith('y') || answer.StartsWith('Y');
+    }
+
+    private static string Ask(string question)
+    {
+        Console.Write($"{question} ");
+        // End of input (e.g. nothing piped in) counts as Enter.
+        return Console.ReadLine()?.Trim() ?? "";
+    }
+}
 
 static class Paths
 {
