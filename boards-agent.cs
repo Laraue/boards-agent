@@ -110,7 +110,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, Guid userId)
         catch (Exception e) when (e is not OperationCanceledException)
         {
             Log.Error($"{run.IssueKey}: {e.Message}");
-            await Fail(run, $"boards-agent couldn't start: {e.Message}");
+            await Fail(run, "Couldn't start the work", e.Message);
             return true;
         }
 
@@ -145,7 +145,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, Guid userId)
             {
                 agent.Kill();
                 Log.Info($"{run.IssueKey}: the runner was stopped - Claude Code killed.");
-                await Fail(run, "boards-agent was stopped on the developer's machine before the work was finished.");
+                await Fail(run, "The runner was stopped", "boards-agent was shut down on the developer's machine before the work was finished.");
                 return;
             }
 
@@ -153,7 +153,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, Guid userId)
             {
                 agent.Kill();
                 Log.Info($"{run.IssueKey}: timed out after {config.TimeoutMinutes} min - Claude Code killed.");
-                await Fail(run, $"boards-agent stopped Claude Code: no result after {config.TimeoutMinutes} minutes. {agent.Summary()}");
+                await Fail(run, $"Timed out after {config.TimeoutMinutes} min", agent.Summary());
                 return;
             }
 
@@ -170,7 +170,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, Guid userId)
         Log.Info($"{run.IssueKey}: Claude Code exited ({agent.ExitCode}), run {run.Id} is {finalState}. {agent.Summary()}");
         if (finalState == AgentRunStates.Working)
         {
-            await Fail(run, $"Claude Code stopped without finishing the run (exit code {agent.ExitCode}). {agent.Summary()}");
+            await Fail(run, "Claude Code stopped without finishing", $"Exit code {agent.ExitCode}. {agent.Summary()}");
         }
     }
 
@@ -200,19 +200,26 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, Guid userId)
     }
 
     /// <summary>
-    /// Records why the run failed, as a comment people see and on the run itself. Not cancellable: a run left
-    /// Working would keep the issue locked.
+    /// Fails the run: the short reason goes on the run (the web app shows it on the agent badge), the details in a
+    /// comment. Not cancellable: a run left Working would keep the issue locked.
     /// </summary>
-    private async Task Fail(AgentRunSummary run, string reason)
+    private async Task Fail(AgentRunSummary run, string reason, string details)
     {
-        if (reason.Length > MaxReasonLength)
+        var comment = $"""
+            **Agent run failed: {reason}.**
+
+            {details}
+
+            Move the issue back to a not-started status to hand it to the agent again.
+            """;
+        if (comment.Length > MaxReasonLength)
         {
-            reason = reason[..MaxReasonLength];
+            comment = comment[..MaxReasonLength];
         }
 
         try
         {
-            await boards.CreateComment(run.IssueKey, reason, CancellationToken.None);
+            await boards.CreateComment(run.IssueKey, comment, CancellationToken.None);
             if (await boards.FinishAgentRun(run.Id, AgentRunStates.Failed, reason, CancellationToken.None))
             {
                 Log.Info($"{run.IssueKey}: run {run.Id} finished as Failed.");
