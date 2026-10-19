@@ -420,13 +420,26 @@ sealed class ClaudeAgent : IDisposable
                 _log.WriteLine(line);
             }
 
-            if (line.StartsWith("{\"type\":\"result\""))
+            if (IsResult(line))
             {
                 _resultLine = line;
             }
         }
 
         await stderr;
+    }
+
+    private static bool IsResult(string line)
+    {
+        try
+        {
+            using var message = JsonDocument.Parse(line);
+            return message.RootElement.TryGetProperty("type", out var type) && type.GetString() == "result";
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
     }
 
     public void Dispose()
