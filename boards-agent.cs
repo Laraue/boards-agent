@@ -27,6 +27,15 @@ Console.CancelKeyPress += (_, e) =>
     stop.Cancel();
 };
 
+// launchd/systemd stop the runner with SIGTERM: stop like Ctrl+C, so a run in progress is failed, not left Working.
+using var sigterm = System.Runtime.InteropServices.PosixSignalRegistration.Create(
+    System.Runtime.InteropServices.PosixSignal.SIGTERM,
+    context =>
+    {
+        context.Cancel = true;
+        stop.Cancel();
+    });
+
 if (options.Command == RunnerArgs.SetupCommand)
 {
     try
@@ -37,6 +46,11 @@ if (options.Command == RunnerArgs.SetupCommand)
     {
         return 1;
     }
+}
+
+if (options.Command == RunnerArgs.ServiceCommand)
+{
+    return Service.Run(options);
 }
 
 var config = RunnerConfig.Load(options.ConfigPath);
@@ -609,7 +623,8 @@ static class Git
 {
     /// <summary>
     /// A worktree on branch agent/KEY under the worktree folder. Reuses the worktree, or the branch, left by an
-    /// earlier run of the same issue.
+    /// earlier run of the same issue. A new branch starts from <paramref name="baseRef"/> fetched just before, so
+    /// e.g. origin/main isn't however old the checkout's last fetch was.
     /// </summary>
     public static Worktree CreateWorktree(string repo, string baseRef, string worktreeFolder, string issueKey)
     {
@@ -628,10 +643,38 @@ static class Git
         }
         else
         {
+            FetchRemoteRef(repo, baseRef);
             Run(repo, ["worktree", "add", "-b", branch, path, baseRef]);
         }
 
         return new Worktree(path, branch, baseRef);
+    }
+
+    /// <summary>
+    /// Fetches <paramref name="baseRef"/> when it's a remote branch (e.g. origin/main). A failed fetch (offline, no access)
+    /// isn't fatal: the work starts from the ref as it is.
+    /// </summary>
+    private static void FetchRemoteRef(string repo, string baseRef)
+    {
+        var slash = baseRef.IndexOf('/');
+        if (slash <= 0)
+        {
+            return;
+        }
+
+        var remote = baseRef[..slash];
+        var remotes = Run(repo, ["remote"], throwOnError: false).Output
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (!remotes.Contains(remote))
+        {
+            return;
+        }
+
+        var fetch = Run(repo, ["fetch", "--quiet", remote, baseRef[(slash + 1)..]], throwOnError: false);
+        if (fetch.ExitCode != 0)
+        {
+            Log.Error($"git fetch {remote} {baseRef[(slash + 1)..]} failed, starting from {baseRef} as it is: {fetch.Error.Trim()}");
+        }
     }
 
     /// <summary>The top folder of the git checkout <paramref name="folder"/> is in, or null when it isn't in one.</summary>
@@ -656,6 +699,8 @@ static class Git
     private static ProcessResult Run(string workingDirectory, string[] arguments, bool throwOnError = true)
     {
         var info = new System.Diagnostics.ProcessStartInfo("git") { WorkingDirectory = workingDirectory };
+        // In the background service nobody can answer a credentials prompt: fail instead of waiting for one.
+        info.Environment["GIT_TERMINAL_PROMPT"] = "0";
         foreach (var argument in arguments)
         {
             info.ArgumentList.Add(argument);
@@ -720,13 +765,17 @@ sealed record RunnerArgs(
     string? WebUrl,
     string? ApiUrl,
     string? McpUrl,
-    bool NoBrowser)
+    bool NoBrowser,
+    string? ServiceAction)
 {
     public const string SetupCommand = "setup";
 
+    public const string ServiceCommand = "service";
+
     private const string Usage =
         "Usage: boards-agent [setup] [--config <file>] [--once] [--dry-run] [--check] [--version]\n" +
-        "       boards-agent setup [--no-browser] [--web-url <url>] [--api-url <url>] [--mcp-url <url>]";
+        "       boards-agent setup [--no-browser] [--web-url <url>] [--api-url <url>] [--mcp-url <url>]\n" +
+        "       boards-agent service install|uninstall|status [--config <file>]";
 
     public static RunnerArgs Parse(string[] args)
     {
@@ -740,12 +789,17 @@ sealed record RunnerArgs(
         string? apiUrl = null;
         string? mcpUrl = null;
         var noBrowser = false;
+        string? serviceAction = null;
         for (var i = 0; i < args.Length; i++)
         {
             switch (args[i])
             {
                 case SetupCommand when i == 0:
                     command = SetupCommand;
+                    break;
+                case ServiceCommand when i == 0 && i + 1 < args.Length:
+                    command = ServiceCommand;
+                    serviceAction = args[++i];
                     break;
                 case "--config" when i + 1 < args.Length:
                     configPath = Paths.Expand(args[++i]);
@@ -779,7 +833,12 @@ sealed record RunnerArgs(
             }
         }
 
-        return new RunnerArgs(command, configPath, once, dryRun, check, version, webUrl, apiUrl, mcpUrl, noBrowser);
+        if (command == ServiceCommand && serviceAction is not ("install" or "uninstall" or "status"))
+        {
+            throw new ArgumentException($"Unknown service action: {serviceAction}.\n{Usage}");
+        }
+
+        return new RunnerArgs(command, configPath, once, dryRun, check, version, webUrl, apiUrl, mcpUrl, noBrowser, serviceAction);
     }
 }
 
@@ -1088,6 +1147,197 @@ sealed record IssueDetail(string Key, string Title, string Status, long? StatusI
 [JsonSerializable(typeof(bool))]
 partial class RunnerJson : JsonSerializerContext;
 
+/// <summary>
+/// `boards-agent service`: runs the runner in the background as a launchd LaunchAgent (macOS), started at login and
+/// restarted if it stops, logging to <see cref="LogPath"/>. systemd and Windows aren't supported yet.
+/// </summary>
+static class Service
+{
+    private const string Label = "com.laraue.boards-agent";
+
+    public static bool IsSupported => OperatingSystem.IsMacOS();
+
+    public static bool IsInstalled => File.Exists(PlistPath);
+
+    private static string Home => Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+
+    private static string PlistPath => Path.Combine(Home, "Library", "LaunchAgents", $"{Label}.plist");
+
+    public static string LogPath => Path.Combine(Home, "Library", "Logs", "boards-agent", "boards-agent.log");
+
+    /// <summary>launchd's domain for the signed-in user's GUI session - where the Keychain is unlocked.</summary>
+    private static string Domain => $"gui/{Uid()}";
+
+    public static int Run(RunnerArgs options)
+    {
+        if (!IsSupported)
+        {
+            Console.WriteLine("The background service is macOS-only for now. Run `boards-agent` in a terminal instead.");
+            return 1;
+        }
+
+        return options.ServiceAction switch
+        {
+            "install" => Install(options.ConfigPath),
+            "uninstall" => Uninstall(),
+            _ => Status(),
+        };
+    }
+
+    public static int Install(string configPath)
+    {
+        var executable = StableExecutablePath();
+        if (executable is null)
+        {
+            Console.WriteLine("The service needs the boards-agent binary (e.g. from Homebrew), not `dotnet run`.");
+            return 1;
+        }
+
+        var config = RunnerConfig.TryLoad(configPath);
+        if (config is null || config.Spaces.Count == 0 || ApiKeySource.Resolve(config) is null)
+        {
+            Console.WriteLine("Run `boards-agent setup` first: the service needs a signed-in config with a mapped space.");
+            return 1;
+        }
+
+        Directory.CreateDirectory(Path.GetDirectoryName(PlistPath)!);
+        Directory.CreateDirectory(Path.GetDirectoryName(LogPath)!);
+        File.WriteAllText(PlistPath, Plist(executable, configPath));
+
+        Shell.Run("/bin/launchctl", "bootout", $"{Domain}/{Label}");
+        var bootstrap = Shell.Run("/bin/launchctl", "bootstrap", Domain, PlistPath);
+        if (bootstrap.ExitCode != 0)
+        {
+            Console.WriteLine($"launchctl couldn't start the service: {bootstrap.Error.Trim()}");
+            return 1;
+        }
+
+        Console.WriteLine("The agent runs in the background now, and starts again when you sign in to your Mac.");
+        Console.WriteLine($"Log: {LogPath}");
+        Console.WriteLine("Hand an issue to the agent in Boards. `boards-agent service status` shows what it's doing.");
+        return 0;
+    }
+
+    /// <summary>Restarts the running service, e.g. after setup changed the config.</summary>
+    public static void Restart()
+    {
+        Shell.Run("/bin/launchctl", "kickstart", "-k", $"{Domain}/{Label}");
+    }
+
+    private static int Uninstall()
+    {
+        Shell.Run("/bin/launchctl", "bootout", $"{Domain}/{Label}");
+        if (File.Exists(PlistPath))
+        {
+            File.Delete(PlistPath);
+        }
+
+        Console.WriteLine($"The background service is removed. The log stays at {LogPath}.");
+        return 0;
+    }
+
+    private static int Status()
+    {
+        if (!IsInstalled)
+        {
+            Console.WriteLine("The background service isn't installed. `boards-agent service install` installs it.");
+            return 1;
+        }
+
+        var print = Shell.Run("/bin/launchctl", "print", $"{Domain}/{Label}");
+        var state = print.ExitCode == 0
+            ? print.Output.Split('\n').Select(x => x.Trim()).FirstOrDefault(x => x.StartsWith("state = "))?["state = ".Length..] ?? "unknown"
+            : "not loaded";
+        var pid = print.Output.Split('\n').Select(x => x.Trim()).FirstOrDefault(x => x.StartsWith("pid = "))?["pid = ".Length..];
+        Console.WriteLine($"Service: {state}{(pid is null ? "" : $" (pid {pid})")}");
+        Console.WriteLine($"Log: {LogPath}");
+        if (File.Exists(LogPath))
+        {
+            Console.WriteLine();
+            foreach (var line in File.ReadLines(LogPath).TakeLast(15))
+            {
+                Console.WriteLine(line);
+            }
+        }
+
+        return print.ExitCode == 0 ? 0 : 1;
+    }
+
+    /// <summary>
+    /// The binary to start: Homebrew's version-free link rather than the versioned Cellar path, so the service keeps
+    /// working after `brew upgrade`. Null when the runner runs as `dotnet run` rather than as a binary.
+    /// </summary>
+    private static string? StableExecutablePath()
+    {
+        var path = Environment.ProcessPath;
+        if (path is null || Path.GetFileNameWithoutExtension(path) == "dotnet")
+        {
+            return null;
+        }
+
+        var cellar = path.IndexOf("/Cellar/boards-agent/", StringComparison.Ordinal);
+        if (cellar > 0)
+        {
+            var linked = Path.Combine(path[..cellar], "bin", "boards-agent");
+            if (File.Exists(linked))
+            {
+                return linked;
+            }
+        }
+
+        return path;
+    }
+
+    /// <summary>
+    /// The LaunchAgent. It gets this shell's PATH, since launchd's own is minimal and Claude Code runs the project's
+    /// build tools (dotnet, node, ...) through it.
+    /// </summary>
+    private static string Plist(string executable, string configPath)
+    {
+        static string Escape(string value) => System.Security.SecurityElement.Escape(value);
+
+        var path = Environment.GetEnvironmentVariable("PATH") ?? "/usr/bin:/bin:/usr/sbin:/sbin";
+        return $"""
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+              <key>Label</key>
+              <string>{Label}</string>
+              <key>ProgramArguments</key>
+              <array>
+                <string>{Escape(executable)}</string>
+                <string>--config</string>
+                <string>{Escape(configPath)}</string>
+              </array>
+              <key>EnvironmentVariables</key>
+              <dict>
+                <key>PATH</key>
+                <string>{Escape(path)}</string>
+              </dict>
+              <key>WorkingDirectory</key>
+              <string>{Escape(Home)}</string>
+              <key>RunAtLoad</key>
+              <true/>
+              <key>KeepAlive</key>
+              <true/>
+              <key>ThrottleInterval</key>
+              <integer>60</integer>
+              <key>StandardOutPath</key>
+              <string>{Escape(LogPath)}</string>
+              <key>StandardErrorPath</key>
+              <string>{Escape(LogPath)}</string>
+            </dict>
+            </plist>
+            """;
+    }
+
+    private static string Uid()
+    {
+        return Shell.Run("/usr/bin/id", "-u").Output.Trim();
+    }
+}
+
 /// <summary>Where the runner's API key comes from: the environment variable when set, else the credential store.</summary>
 static class ApiKeySource
 {
@@ -1369,7 +1619,29 @@ static class Setup
         Console.WriteLine();
         Console.WriteLine(config.Spaces.Count == 0
             ? "No space is mapped to a repository yet, so there's nothing to watch. Run `boards-agent setup` again to map one."
-            : $"Done. Watching {string.Join(", ", config.Spaces.Keys)}. Start the runner with `boards-agent`, then hand an issue to the agent in Boards.");
+            : $"Done. Watching {string.Join(", ", config.Spaces.Keys)}.");
+        if (config.Spaces.Count > 0 && Service.IsSupported)
+        {
+            if (Service.IsInstalled)
+            {
+                // The running service read the old config at start.
+                Service.Restart();
+                Console.WriteLine("The background service was restarted with the new settings. Hand an issue to the agent in Boards.");
+            }
+            else if (Confirm("Run the agent in the background, also after you restart the computer?", defaultYes: true))
+            {
+                return Service.Install(options.ConfigPath);
+            }
+            else
+            {
+                Console.WriteLine("Start the runner with `boards-agent`, then hand an issue to the agent in Boards.");
+            }
+        }
+        else if (config.Spaces.Count > 0)
+        {
+            Console.WriteLine("Start the runner with `boards-agent`, then hand an issue to the agent in Boards.");
+        }
+
         return 0;
     }
 

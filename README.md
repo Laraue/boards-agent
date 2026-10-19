@@ -9,7 +9,7 @@ You click **Hand to agent** on an issue assigned to you. boards-agent, running o
 ## How it works
 
 1. boards-agent polls `list_agent_runs` for Ready runs on issues assigned to you, in the spaces you mapped to local repositories.
-2. It claims a run, which the server only allows for the assignee's own key and not while the issue is blocked. It moves the issue to the epic's first In Progress status and creates the worktree.
+2. It claims a run, which the server only allows for the assignee's own key and not while the issue is blocked. It moves the issue to the epic's first In Progress status, fetches the base branch (e.g. `origin/main`) and creates the worktree.
 3. It starts `claude -p` in the worktree with the bundled `work-on-issue` skill. The skill:
    - reads the issue, its comments and its links
    - posts a plan, commits on the branch, and runs the build and tests
@@ -34,7 +34,6 @@ Download the archive for your system from [Releases](https://github.com/Laraue/b
 tar -xzf boards-agent-v0.1.0-osx-arm64.tar.gz
 cd boards-agent
 ./boards-agent setup
-./boards-agent
 ```
 
 ## Setup
@@ -44,12 +43,19 @@ Run `boards-agent setup`, ideally from inside the repository you want the agent 
 1. Opens Boards in your browser. Check the code, pick the organization and click **Allow**. Boards creates an API key named "Claude Code agent (your machine)" and hands it to the runner, which keeps it in the Keychain. You can revoke the key any time under Account -> API keys.
 2. Asks which space's issues are worked on in which local repository, offering the one you ran it in. New branches start from the remote's default branch (e.g. `origin/main`).
 3. Finds Claude Code and runs `claude auth login` if it isn't signed in.
+4. Offers to run the agent in the background (macOS), so there's no terminal to keep open. After that, clicking **Hand to agent** in Boards is all there is to it.
 
 The answers go to `~/.config/boards-agent/config.json` (`%APPDATA%\boards-agent\config.json` on Windows), which the runner reads by default. Running setup again keeps what's there. Use `--no-browser` to just print the link, e.g. over SSH. `--config <file>` points both setup and the runner at another config file; `boards-agent.example.json` lists every setting. Setting `BOARDS_AGENT_API_KEY` overrides the stored key.
 
 The macOS binaries aren't notarized yet. If macOS refuses to open the binary, allow it in System Settings -> Privacy & Security, or run `xattr -d com.apple.quarantine boards-agent`.
 
-`--check` prints the version, which Claude Code it found, and who your key signs in as. `--dry-run` lists Ready runs without claiming them. `--once` polls once and exits.
+## Background service
+
+`boards-agent service install` runs the runner as a launchd LaunchAgent: it starts now and whenever you sign in to your Mac, and restarts if it stops. It keeps the `PATH` of the terminal you install it from, so Claude Code finds your build tools. `boards-agent service status` shows whether it runs and the end of its log, `~/Library/Logs/boards-agent/boards-agent.log`. `boards-agent service uninstall` removes it. Stopping the service fails a run in progress, so the issue isn't left locked. Linux (systemd) and Windows aren't supported yet: run `boards-agent` in a terminal there.
+
+## Commands
+
+`boards-agent` runs in the foreground. `--check` prints the version, which Claude Code it found, and who your key signs in as. `--dry-run` lists Ready runs without claiming them. `--once` polls once and exits.
 
 ## Release
 
