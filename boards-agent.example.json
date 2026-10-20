@@ -15,13 +15,19 @@
   },
   // Where the worktrees go: <worktreeFolder>/<KEY>.
   "worktreeFolder": "~/boards-agent-worktrees",
+  // The coding agent: "claude" (Claude Code) or "codex" (OpenAI Codex). Setup asks when both are installed.
+  "agent": "claude",
   // "claude" = the one on PATH, or else the newest one bundled with the Claude desktop app.
   "claudePath": "claude",
-  // Limits for one run: Claude Code's --max-turns and --max-budget-usd, and a wall-clock timeout.
+  // "codex" = the one on PATH.
+  "codexPath": "codex",
+  // Codex only: let the commands it runs reach the network (package restores - but also git push). Off by default.
+  "codexNetworkAccess": false,
+  // Limits for one run: Claude Code's --max-turns and --max-budget-usd, and a wall-clock timeout (Codex: the timeout only).
   "maxTurns": 50,
   "maxBudgetUsd": 5,
   "timeoutMinutes": 60,
-  // What the agent may run without asking, besides editing files in the worktree. Everything else is denied;
+  // Claude Code only: what it may run without asking, besides editing files in the worktree. Everything else is denied;
   // git push, gh, WebFetch and WebSearch are always denied. Add your project's build/test commands here.
   "allowedTools": [
     "Bash(dotnet build:*)", "Bash(dotnet test:*)", "Bash(dotnet restore:*)",

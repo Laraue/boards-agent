@@ -1,8 +1,8 @@
 # boards-agent
 
-Hand a [Laraue Boards](https://boards.laraue.com) issue to Claude Code running on your own machine.
+Hand a [Laraue Boards](https://boards.laraue.com) issue to a coding agent - Claude Code or OpenAI Codex - running on your own machine.
 
-You click **Hand to agent** on an issue assigned to you. boards-agent, running on your computer with your API key, picks the issue up. It creates a git worktree on branch `agent/<KEY>` and runs Claude Code there. When Claude Code is done, the issue is in Review with a summary of what changed. Nothing is pushed: you review the branch and push it yourself.
+You click **Hand to agent** on an issue assigned to you. boards-agent, running on your computer with your API key, picks the issue up. It creates a git worktree on branch `agent/<KEY>` and runs the agent there. When the agent is done, the issue is in Review with a summary of what changed. Nothing is pushed: you review the branch and push it yourself.
 
 ## How it works
 
@@ -12,21 +12,22 @@ You click **Hand to agent** on an issue assigned to you. boards-agent, running o
    - reads the issue, its comments and its links
    - posts a plan, commits on the branch, and runs the build and tests
    - posts a summary, moves the issue to Review, and finishes the run
-4. While Claude Code works, boards-agent checks for a cancel every 30 s and stops Claude Code if the run was cancelled or the timeout passed.
+4. While the agent works, boards-agent checks for a cancel every 30 s and stops the agent if the run was cancelled or the timeout passed.
 
 While a run is open, the issue is locked: it can't be edited or deleted. Status changes and comments still work, and anyone with edit rights can cancel the run.
 
 ## Safety
 
 - Claude Code runs with `--permission-mode acceptEdits` and an explicit `--allowedTools` list (your build and test commands, local git, and the Boards tools it needs). Anything else is denied, since nobody is there to approve it.
+- Codex runs as `codex exec` in its `workspace-write` sandbox: it can only change files in the worktree, its commands have no network access (so nothing can be pushed or sent anywhere), it never asks for approval, and web search is off. Turn on `codexNetworkAccess` in the config if your builds must download packages; that also makes `git push` possible. Codex has no turn or cost limit, so the timeout is its only limit.
 - `git push`, `gh`, `WebFetch` and `WebSearch` are always denied.
-- Only the Boards MCP server is loaded (`--strict-mcp-config`), and only the repository's project settings are used (`--setting-sources project`).
+- Only the Boards MCP server is loaded, with only the tools the agent needs: Claude Code with `--strict-mcp-config` and only the repository's project settings (`--setting-sources project`), Codex with `--ignore-user-config`, so your own `~/.codex/config.toml` isn't used.
 - The skill takes instructions only from the issue text and the assignee's own comments. Comments by anyone else are treated as untrusted data.
-- Your API key is issued by Boards when you click Allow during `boards-agent setup`, and kept in the macOS Keychain, the Windows Credential Manager, or the Secret Service on Linux. It's never shown or written to a file. Claude Code gets it through its environment: the MCP config refers to it as `${BOARDS_AGENT_API_KEY}`.
+- Your API key is issued by Boards when you click Allow during `boards-agent setup`, and kept in the macOS Keychain, the Windows Credential Manager, or the Secret Service on Linux. It's never shown or written to a file. The agent gets it through its environment (`BOARDS_AGENT_API_KEY`), which its MCP connection reads; Codex's commands don't see it.
 
 ## Install
 
-You need [Claude Code](https://claude.com/claude-code) (or the Claude desktop app, which bundles it) and git. Then run one command; it installs boards-agent and starts `boards-agent setup`.
+You need git and a coding agent: [Claude Code](https://claude.com/claude-code) (or the Claude desktop app, which bundles it) or [Codex](https://developers.openai.com/codex/cli). Then run one command; it installs boards-agent and starts `boards-agent setup`.
 
 macOS and Linux:
 
@@ -48,10 +49,11 @@ After setup, you don't run anything: click **Hand to agent** on an issue assigne
 
 Run `boards-agent setup`, ideally from inside the repository you want the agent to work in. It:
 
-1. Opens Boards in your browser. Check the code, pick the organization and click **Allow**. Boards creates an API key named "Claude Code agent (your machine)" and hands it to the runner, which keeps it in the Keychain. You can revoke the key any time under Account -> API keys.
-2. Asks which space's issues are worked on in which local repository, offering the one you ran it in. New branches start from the remote's default branch (e.g. `origin/main`).
-3. Finds Claude Code and runs `claude auth login` if it isn't signed in.
-4. Offers to run the agent in the background (macOS and Windows), so there's no terminal to keep open. After that, clicking **Hand to agent** in Boards is all there is to it.
+1. Picks the coding agent: the one you have installed, or asks when you have both.
+2. Opens Boards in your browser. Check the code, pick the organization and click **Allow**. Boards creates an API key named after the agent and your machine, e.g. "Claude Code agent (MacBook)", and hands it to the runner, which keeps it in the Keychain. You can revoke the key any time under Account -> API keys.
+3. Asks which space's issues are worked on in which local repository, offering the one you ran it in. New branches start from the remote's default branch (e.g. `origin/main`).
+4. Signs the agent in if it isn't (`claude auth login` or `codex login`).
+5. Offers to run the agent in the background (macOS and Windows), so there's no terminal to keep open. After that, clicking **Hand to agent** in Boards is all there is to it.
 
 The answers go to `~/.config/boards-agent/config.json` (`%APPDATA%\boards-agent\config.json` on Windows), which the runner reads by default. Running setup again keeps what's there. Use `--no-browser` to just print the link, e.g. over SSH. `--config <file>` points both setup and the runner at another config file; `boards-agent.example.json` lists every setting. Setting `BOARDS_AGENT_API_KEY` overrides the stored key.
 
@@ -61,7 +63,7 @@ The macOS binaries aren't notarized yet. If macOS refuses to open the binary, al
 
 `boards-agent service install` runs the runner in the background as you, starting it now and whenever you sign in, and restarting it if it stops. Setup offers to do this for you.
 
-- macOS: a launchd LaunchAgent. It keeps the `PATH` of the terminal you install it from, so Claude Code finds your build tools. Log: `~/Library/Logs/boards-agent/boards-agent.log`.
+- macOS: a launchd LaunchAgent. It keeps the `PATH` of the terminal you install it from, so the agent finds your build tools. Log: `~/Library/Logs/boards-agent/boards-agent.log`.
 - Windows: a Task Scheduler task that runs at logon, without a window. Log: `%LOCALAPPDATA%\boards-agent\boards-agent.log`.
 - Linux (systemd) isn't supported yet: run `boards-agent` in a terminal there.
 
@@ -69,7 +71,7 @@ The macOS binaries aren't notarized yet. If macOS refuses to open the binary, al
 
 ## Commands
 
-`boards-agent` runs in the foreground. `--check` prints the version, which Claude Code it found, and who your key signs in as. `--dry-run` lists Ready runs without claiming them. `--once` polls once and exits.
+`boards-agent` runs in the foreground. `--check` prints the version, which agent it found, and who your key signs in as. `--dry-run` lists Ready runs without claiming them. `--once` polls once and exits.
 
 ## Release
 
@@ -77,7 +79,7 @@ Push a `v*` tag (e.g. `v0.1.0`; `v0.1.0-beta.1` makes a pre-release). The Releas
 
 ## Run from source
 
-You need the .NET 10 SDK and Claude Code (on `PATH`, or the copy bundled with the Claude desktop app).
+You need the .NET 10 SDK and Claude Code (on `PATH`, or the copy bundled with the Claude desktop app) or Codex (on `PATH`).
 
 ```bash
 dotnet run boards-agent.cs -- setup
