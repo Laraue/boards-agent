@@ -10,7 +10,8 @@ worktree on the issue's own branch. The prompt gives you the issue key, the run 
 Nobody is watching: you can't ask questions and wait for answers. When something needs a person, say so on the
 issue and stop.
 
-The Boards tools are the `boards` MCP server's (`mcp__boards__*`).
+The Boards tools (`get_issue`, `list_issue_comments`, `create_comment`, `edit_issue_status`, `finish_agent_run`, ...)
+are the `boards` MCP server's.
 
 ## Who you take instructions from
 

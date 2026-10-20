@@ -310,6 +310,9 @@ static class StatusCategories
 /// </summary>
 interface ICodingAgent
 {
+    /// <summary>The config value that picks this agent (<see cref="RunnerConfig.Agent"/>).</summary>
+    string Key { get; }
+
     /// <summary>The agent's name in the log and in setup, e.g. "Claude Code".</summary>
     string Name { get; }
 
@@ -333,10 +336,41 @@ interface ICodingAgent
 
 static class CodingAgents
 {
+    public const string Claude = "claude";
+
+    public const string Codex = "codex";
+
     /// <summary>The agent the config chooses.</summary>
     public static ICodingAgent For(RunnerConfig config)
     {
-        return new ClaudeCodeAgent(config);
+        return config.Agent.ToLowerInvariant() switch
+        {
+            Claude => new ClaudeCodeAgent(config),
+            Codex => new CodexAgent(config),
+            _ => throw new InvalidOperationException($"Unknown agent \"{config.Agent}\" in the config: use \"{Claude}\" or \"{Codex}\"."),
+        };
+    }
+
+    /// <summary>Every agent the runner supports.</summary>
+    public static ICodingAgent[] All(RunnerConfig config)
+    {
+        return [new ClaudeCodeAgent(config), new CodexAgent(config)];
+    }
+
+    /// <summary>
+    /// The executable called <paramref name="name"/> on PATH or in ~/.local/bin, where native installers put it. On Windows,
+    /// a real .exe before an npm .cmd shim, which goes through cmd.exe's argument quoting.
+    /// </summary>
+    public static string? FindOnPath(string name)
+    {
+        string[] names = OperatingSystem.IsWindows() ? [$"{name}.exe", $"{name}.cmd"] : [name];
+        var folders = (Environment.GetEnvironmentVariable("PATH") ?? "")
+            .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
+            .Append(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin"))
+            .ToList();
+        return names
+            .SelectMany(file => folders.Select(folder => Path.Combine(folder, file)))
+            .FirstOrDefault(File.Exists);
     }
 
     /// <summary>The Boards MCP tools the agent may call. Not edit_issue/delete_issue (locked anyway) or the run tools other than finish.</summary>
@@ -468,6 +502,8 @@ sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
         "WebSearch",
     ];
 
+    public string Key => CodingAgents.Claude;
+
     public string Name => "Claude Code";
 
     public string ClientName => "Claude Code agent";
@@ -485,15 +521,7 @@ sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
             return Paths.Expand(config.ClaudePath);
         }
 
-        // On Windows, the native claude.exe before npm's claude.cmd shim, which goes through cmd.exe's argument quoting.
-        string[] names = OperatingSystem.IsWindows() ? ["claude.exe", "claude.cmd"] : ["claude"];
-        var folders = (Environment.GetEnvironmentVariable("PATH") ?? "")
-            .Split(Path.PathSeparator, StringSplitOptions.RemoveEmptyEntries)
-            .Append(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "bin"))
-            .ToList();
-        var onPath = names
-            .SelectMany(name => folders.Select(folder => Path.Combine(folder, name)))
-            .FirstOrDefault(File.Exists);
+        var onPath = CodingAgents.FindOnPath("claude");
         if (onPath is not null)
         {
             return onPath;
@@ -657,6 +685,164 @@ sealed class ClaudeCodeProcess(System.Diagnostics.Process process, string logPat
     }
 }
 
+/// <summary>
+/// OpenAI's Codex CLI, as <c>codex exec</c>: the workspace-write sandbox (edits only inside the worktree, commands
+/// without network unless <see cref="RunnerConfig.CodexNetworkAccess"/>), no approvals since nobody is there to give
+/// them, web search off, and only the Boards MCP server - the person's own <c>~/.codex/config.toml</c> isn't loaded.
+/// The work-on-issue skill is the same <c>SKILL.md</c> Claude Code uses. Codex has no turn or cost limit: the runner's
+/// timeout is the only one.
+/// </summary>
+sealed class CodexAgent(RunnerConfig config) : ICodingAgent
+{
+    public string Key => CodingAgents.Codex;
+
+    public string Name => "Codex";
+
+    public string ClientName => "Codex agent";
+
+    public string InstallUrl => "https://developers.openai.com/codex/cli";
+
+    public string FindExecutable()
+    {
+        if (config.CodexPath != "codex")
+        {
+            return Paths.Expand(config.CodexPath);
+        }
+
+        return CodingAgents.FindOnPath("codex")
+            ?? throw new FileNotFoundException("Codex wasn't found: put codex on PATH or set codexPath in the config.");
+    }
+
+    /// <summary>Whether Codex is signed in, by <c>codex login status</c>'s exit code.</summary>
+    public bool IsSignedIn(string executable)
+    {
+        return Shell.Run(executable, "login", "status").ExitCode == 0;
+    }
+
+    /// <summary><c>codex login</c> in this terminal - the person signs in in the browser it opens.</summary>
+    public void SignIn(string executable)
+    {
+        var info = new System.Diagnostics.ProcessStartInfo(executable);
+        info.ArgumentList.Add("login");
+        using var process = System.Diagnostics.Process.Start(info)!;
+        process.WaitForExit();
+    }
+
+    public AgentProcess Start(string apiKey, string spaceKey, AgentRunSummary run, Worktree worktree, string logPath)
+    {
+        var info = new System.Diagnostics.ProcessStartInfo(FindExecutable()) { WorkingDirectory = worktree.Path };
+        var skill = Path.Combine(AgentPlugin.Directory.Value, "skills", "work-on-issue");
+        var tools = string.Join(", ", CodingAgents.BoardsTools.Select(Toml));
+        List<string> arguments =
+        [
+            "exec",
+            "--json",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--sandbox", "workspace-write",
+            "-C", worktree.Path,
+            "-c", "approval_policy=\"never\"",
+            "-c", "web_search=\"disabled\"",
+            "-c", $"sandbox_workspace_write.network_access={(config.CodexNetworkAccess ? "true" : "false")}",
+            // The key reaches the MCP connection, which Codex makes itself, but not the commands it runs.
+            "-c", $"shell_environment_policy.exclude=[{Toml(config.ApiKeyEnv)}]",
+            "-c", $"mcp_servers.boards.url={Toml(config.McpUrl)}",
+            "-c", $"mcp_servers.boards.env_http_headers={{ \"X-Api-Key\" = {Toml(config.ApiKeyEnv)} }}",
+            "-c", $"mcp_servers.boards.enabled_tools=[{tools}]",
+            "-c", "mcp_servers.boards.required=true",
+            "-c", $"skills.config=[{{ path = {Toml(skill)} }}]",
+        ];
+        if (config.CodexModel is { Length: > 0 } model)
+        {
+            arguments.AddRange(["-m", model]);
+        }
+
+        arguments.Add(CodingAgents.Prompt("work-on-issue", spaceKey, run, worktree));
+        foreach (var argument in arguments)
+        {
+            info.ArgumentList.Add(argument);
+        }
+
+        // env_http_headers reads the key from this variable, so it's never on the command line or in a file.
+        info.Environment[config.ApiKeyEnv] = apiKey;
+
+        return new CodexProcess(AgentProcess.Launch(info), logPath);
+    }
+
+    /// <summary>A TOML basic string, for the values of <c>-c key=value</c>.</summary>
+    private static string Toml(string value)
+    {
+        return $"\"{value.Replace("\\", "\\\\").Replace("\"", "\\\"")}\"";
+    }
+}
+
+/// <summary>
+/// Codex's <c>--json</c> output, one event per line: <c>turn.completed</c> carries the token usage, <c>turn.failed</c>
+/// and <c>error</c> what went wrong, and an <c>item.completed</c> of type <c>agent_message</c> the final answer.
+/// </summary>
+sealed class CodexProcess(System.Diagnostics.Process process, string logPath) : AgentProcess(process, logPath)
+{
+    private int _turns;
+    private long _inputTokens;
+    private long _outputTokens;
+    private string? _error;
+
+    public override string Summary()
+    {
+        var outcome = _error is null ? "completed" : "failed";
+        var turns = _turns == 1 ? "1 turn" : $"{_turns} turns";
+        var summary = $"Codex: {outcome}, {turns}, {_inputTokens + _outputTokens:N0} tokens ({_inputTokens:N0} in, {_outputTokens:N0} out).";
+        return _error is null ? summary : $"{summary} {_error}";
+    }
+
+    protected override void OnOutputLine(string line)
+    {
+        try
+        {
+            using var message = JsonDocument.Parse(line);
+            var root = message.RootElement;
+            switch (root.TryGetProperty("type", out var type) ? type.GetString() : null)
+            {
+                case "turn.completed":
+                    _turns++;
+                    if (root.TryGetProperty("usage", out var usage))
+                    {
+                        _inputTokens += Number(usage, "input_tokens");
+                        _outputTokens += Number(usage, "output_tokens");
+                    }
+
+                    break;
+                case "turn.failed":
+                    _turns++;
+                    _error = ErrorMessage(root);
+                    break;
+                case "error":
+                    _error = ErrorMessage(root);
+                    break;
+            }
+        }
+        catch (JsonException)
+        {
+            // Not an event line; it's in the log anyway.
+        }
+    }
+
+    private static long Number(JsonElement element, string name)
+    {
+        return element.TryGetProperty(name, out var value) && value.TryGetInt64(out var number) ? number : 0;
+    }
+
+    private static string ErrorMessage(JsonElement root)
+    {
+        if (root.TryGetProperty("error", out var error) && error.TryGetProperty("message", out var nested))
+        {
+            return nested.GetString() ?? "Unknown error.";
+        }
+
+        return root.TryGetProperty("message", out var message) ? message.GetString() ?? "Unknown error." : "Unknown error.";
+    }
+}
+
 static class RunnerVersion
 {
     /// <summary>The version the release was built with (-p:Version), without the source revision suffix.</summary>
@@ -668,7 +854,10 @@ static class RunnerVersion
         .Split('+')[0];
 }
 
-/// <summary>The work-on-issue skill, embedded in the runner as a Claude Code plugin and written out (again) on start.</summary>
+/// <summary>
+/// The work-on-issue skill, embedded in the runner and written out (again) on start: a Claude Code plugin folder, whose
+/// <c>skills/work-on-issue</c> Codex loads as a skill too.
+/// </summary>
 static class AgentPlugin
 {
     private const string Prefix = "plugin/";
@@ -936,43 +1125,64 @@ sealed record RunnerArgs(
 /// </summary>
 sealed record RunnerConfig
 {
+    // Settable, not init-only: the JSON source generator sets every missing init-only property to null/0, overriding
+    // the defaults below, so a config written before a setting existed would get no value for it.
     /// <summary>The Boards web app, where setup sends the person to allow the sign-in.</summary>
-    public string WebUrl { get; init; } = "https://boards.laraue.com";
+    public string WebUrl { get; set; } = "https://boards.laraue.com";
 
     /// <summary>The Boards web API, which issues the API key at setup.</summary>
-    public string ApiUrl { get; init; } = "https://boards.laraue.com/boards-api";
+    public string ApiUrl { get; set; } = "https://boards.laraue.com/boards-api";
 
     /// <summary>The Boards MCP endpoint.</summary>
-    public string McpUrl { get; init; } = "https://boards.laraue.com/boards-mcp/mcp";
+    public string McpUrl { get; set; } = "https://boards.laraue.com/boards-mcp/mcp";
 
     /// <summary>The organization the API key belongs to - its credential store entry is named after it.</summary>
-    public long? OrganizationId { get; init; }
+    public long? OrganizationId { get; set; }
 
-    public string? OrganizationName { get; init; }
+    public string? OrganizationName { get; set; }
 
     /// <summary>
     /// An environment variable that, when set, overrides the stored key (e.g. on a machine without a credential
     /// store). Also how Claude Code receives the key: the runner sets it for the Claude it starts.
     /// </summary>
-    public string ApiKeyEnv { get; init; } = "BOARDS_AGENT_API_KEY";
+    public string ApiKeyEnv { get; set; } = "BOARDS_AGENT_API_KEY";
 
     /// <summary>Space key -> the local repository its issues are worked on in. Only these spaces are polled.</summary>
-    public Dictionary<string, SpaceConfig> Spaces { get; init; } = [];
+    public Dictionary<string, SpaceConfig> Spaces { get; set; } = [];
 
     /// <summary>Where the runner creates a git worktree per issue.</summary>
-    public string WorktreeFolder { get; init; } = "~/boards-agent-worktrees";
+    public string WorktreeFolder { get; set; } = "~/boards-agent-worktrees";
 
     /// <summary>
     /// The Claude Code executable. "claude" means the one on PATH, or else the newest one bundled with the Claude
     /// desktop app.
     /// </summary>
-    public string ClaudePath { get; init; } = "claude";
+    public string ClaudePath { get; set; } = "claude";
+
+    /// <summary>
+    /// Which coding agent works on the issues: <see cref="CodingAgents.Claude"/> (Claude Code) or
+    /// <see cref="CodingAgents.Codex"/>. Setup asks when both are installed.
+    /// </summary>
+    public string Agent { get; set; } = CodingAgents.Claude;
+
+    /// <summary>The Codex executable. "codex" means the one on PATH.</summary>
+    public string CodexPath { get; set; } = "codex";
+
+    /// <summary>
+    /// Whether Codex's commands may reach the network. Off: nothing a command runs can push code or send data anywhere
+    /// (the Boards MCP server still works - Codex itself talks to it), but builds can't download packages that aren't
+    /// cached yet. On: restores work, and so would a <c>git push</c>.
+    /// </summary>
+    public bool CodexNetworkAccess { get; set; }
+
+    /// <summary>The model Codex uses; null for Codex's default.</summary>
+    public string? CodexModel { get; set; }
 
     /// <summary>
     /// What Claude Code may do without asking, besides editing files in the worktree (--allowedTools). Anything else
-    /// is denied, since nobody is there to approve it.
+    /// is denied, since nobody is there to approve it. Codex has no such list: its sandbox limits it instead.
     /// </summary>
-    public string[] AllowedTools { get; init; } =
+    public string[] AllowedTools { get; set; } =
     [
         "Bash(dotnet build:*)",
         "Bash(dotnet test:*)",
@@ -985,20 +1195,20 @@ sealed record RunnerConfig
         "Bash(git commit:*)",
     ];
 
-    /// <summary>Claude Code's --max-turns.</summary>
-    public int MaxTurns { get; init; } = 50;
+    /// <summary>Claude Code's --max-turns. Codex has no turn limit; the timeout is its only limit.</summary>
+    public int MaxTurns { get; set; } = 50;
 
-    /// <summary>Claude Code's --max-budget-usd, if the installed version supports it.</summary>
-    public decimal? MaxBudgetUsd { get; init; }
+    /// <summary>Claude Code's --max-budget-usd, if the installed version supports it. Not available for Codex.</summary>
+    public decimal? MaxBudgetUsd { get; set; }
 
     /// <summary>A run taking longer than this is stopped and failed.</summary>
-    public int TimeoutMinutes { get; init; } = 60;
+    public int TimeoutMinutes { get; set; } = 60;
 
     /// <summary>How often a working run is checked for a cancel and the timeout.</summary>
-    public int CancelCheckSeconds { get; init; } = 30;
+    public int CancelCheckSeconds { get; set; } = 30;
 
     /// <summary>How often Ready runs are polled.</summary>
-    public int PollIntervalSeconds { get; init; } = 60;
+    public int PollIntervalSeconds { get; set; } = 60;
 
     /// <summary>~/.config/boards-agent/config.json ($XDG_CONFIG_HOME if set), or %APPDATA%\\boards-agent\\config.json on Windows.</summary>
     public static string DefaultPath
@@ -1054,10 +1264,10 @@ sealed record RunnerConfig
 sealed record SpaceConfig
 {
     /// <summary>The local checkout. Worktrees are created from it, the checkout itself isn't touched.</summary>
-    public required string Repo { get; init; }
+    public required string Repo { get; set; }
 
     /// <summary>What an issue's branch starts from, e.g. origin/main.</summary>
-    public string BaseRef { get; init; } = "HEAD";
+    public string BaseRef { get; set; } = "HEAD";
 }
 
 /// <summary>The Boards MCP tools the runner calls.</summary>
@@ -1842,8 +2052,9 @@ static class BoardsSignIn
 }
 
 /// <summary>
-/// `boards-agent setup`: signs this machine in to Boards (the key goes to the credential store), maps spaces to local
-/// repositories, and makes sure Claude Code is signed in. Writes the config; running it again keeps what's there.
+/// `boards-agent setup`: picks the coding agent, signs this machine in to Boards (the key goes to the credential store),
+/// maps spaces to local repositories, and makes sure the agent is signed in. Writes the config; running it again keeps
+/// what's there.
 /// </summary>
 static class Setup
 {
@@ -1858,9 +2069,19 @@ static class Setup
         };
 
         Console.WriteLine($"boards-agent {RunnerVersion.Value} setup");
-        var codingAgent = CodingAgents.For(config);
 
-        // 1. Boards: reuse a stored key that still works, unless the person wants another organization.
+        // 1. Which coding agent works on the issues - before signing in, since the key is named after it.
+        var codingAgent = ChooseAgent(config);
+        if (codingAgent is null)
+        {
+            Console.WriteLine("No coding agent is installed. Install Claude Code (https://claude.com/claude-code) or Codex "
+                + "(https://developers.openai.com/codex/cli), then run `boards-agent setup` again.");
+            return 1;
+        }
+
+        config = config with { Agent = codingAgent.Key };
+
+        // 2. Boards: reuse a stored key that still works, unless the person wants another organization.
         var apiKey = ApiKeySource.Resolve(config);
         MeInfo? me = apiKey is null ? null : await TryGetMe(config.McpUrl, apiKey, ct);
         if (me is not null && !Confirm($"Signed in to Boards as {me.User.DisplayName}, organization {me.Organization.Name}. Keep it?", defaultYes: true))
@@ -1898,7 +2119,7 @@ static class Setup
             Console.WriteLine($"Signed in as {me.User.DisplayName}, organization {me.Organization.Name}. The API key is in your {CredentialStoreName}.");
         }
 
-        // 2. Which local repository each space's issues are worked on in.
+        // 3. Which local repository each space's issues are worked on in.
         await using (var boards = await BoardsClient.ConnectAsync(config.McpUrl, apiKey!, ct))
         {
             var spaces = await boards.ListSpaces(ct);
@@ -1908,7 +2129,7 @@ static class Setup
         config.Save(options.ConfigPath);
         Console.WriteLine($"Saved {options.ConfigPath}.");
 
-        // 3. The coding agent.
+        // 4. The coding agent's own sign-in.
         string executable;
         try
         {
@@ -1959,6 +2180,62 @@ static class Setup
         }
 
         return 0;
+    }
+
+    /// <summary>
+    /// The installed agent to use: the only one installed, or the person's pick when several are (the config's current
+    /// one by default). Null when none is installed.
+    /// </summary>
+    private static ICodingAgent? ChooseAgent(RunnerConfig config)
+    {
+        var installed = CodingAgents.All(config)
+            .Where(IsInstalled)
+            .ToList();
+        if (installed.Count <= 1)
+        {
+            if (installed.Count == 1)
+            {
+                Console.WriteLine($"Coding agent: {installed[0].Name}.");
+            }
+
+            return installed.FirstOrDefault();
+        }
+
+        var current = installed.FirstOrDefault(x => x.Key == config.Agent.ToLowerInvariant()) ?? installed[0];
+        Console.WriteLine();
+        Console.WriteLine("Which agent should work on the issues you hand off?");
+        for (var i = 0; i < installed.Count; i++)
+        {
+            Console.WriteLine($"  {i + 1}. {installed[i].Name}");
+        }
+
+        while (true)
+        {
+            var answer = Ask($"Number, or Enter for {current.Name}:");
+            if (answer.Length == 0)
+            {
+                return current;
+            }
+
+            if (int.TryParse(answer, out var number) && number >= 1 && number <= installed.Count)
+            {
+                return installed[number - 1];
+            }
+
+            Console.WriteLine($"Enter a number from 1 to {installed.Count}.");
+        }
+    }
+
+    private static bool IsInstalled(ICodingAgent agent)
+    {
+        try
+        {
+            return File.Exists(agent.FindExecutable());
+        }
+        catch (FileNotFoundException)
+        {
+            return false;
+        }
     }
 
     private static string CredentialStoreName => OperatingSystem.IsMacOS() ? "Keychain" : "credential store";
