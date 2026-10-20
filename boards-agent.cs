@@ -1667,8 +1667,11 @@ sealed record SignedIn(string ApiKey, long OrganizationId, string OrganizationNa
 /// </summary>
 static class BoardsSignIn
 {
-    /// <summary>Boards adds the machine name to the key's name, which allows 44 characters for it.</summary>
-    private const int MaxMachineNameLength = 44;
+    /// <summary>How the runner introduces itself: Boards shows it on the Allow page and names the key "&lt;this&gt; (&lt;machine&gt;)".</summary>
+    private const string ClientName = "Claude Code agent";
+
+    /// <summary>Boards allows 37 characters of machine name, so the key name fits.</summary>
+    private const int MaxMachineNameLength = 37;
 
     /// <param name="openBrowser">False prints the link only, e.g. over SSH, to open it on another device.</param>
     /// <param name="replacesApiKey">
@@ -1682,7 +1685,7 @@ static class BoardsSignIn
         var start = await PostAsync(
             http,
             "api/agent-sign-in",
-            new JsonObject { ["machineName"] = MachineName(), ["replacesApiKey"] = replacesApiKey },
+            new JsonObject { ["clientName"] = ClientName, ["machineName"] = MachineName(), ["replacesApiKey"] = replacesApiKey },
             RunnerJson.Default.AgentSignInStart,
             ct);
 
