@@ -1,7 +1,12 @@
 {
-  // The Boards MCP endpoint. Production: https://boards.laraue.com/boards-mcp/mcp
-  "mcpUrl": "http://localhost:5202/mcp",
-  // The environment variable that holds your Boards API key (Account -> API keys). Never put the key here.
+  // `boards-agent setup` writes this file to ~/.config/boards-agent/config.json; you don't need to copy it.
+  // The Boards web app, web API and MCP endpoint. Defaults: production.
+  "webUrl": "https://boards.laraue.com",
+  "apiUrl": "https://boards.laraue.com/boards-api",
+  "mcpUrl": "https://boards.laraue.com/boards-mcp/mcp",
+  // The organization the API key belongs to. Setup sets it; the key itself is in the Keychain, never here.
+  "organizationId": 1,
+  // When this environment variable is set, it overrides the stored key. Claude Code receives the key through it.
   "apiKeyEnv": "BOARDS_AGENT_API_KEY",
   // Space key -> the local repository its issues are worked on in. Only these spaces are polled.
   // Each issue gets a worktree on branch agent/<KEY>, started from baseRef (default HEAD); the checkout itself isn't touched.
