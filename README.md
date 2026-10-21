@@ -2,17 +2,17 @@
 
 Hand a [Laraue Boards](https://boards.laraue.com) issue to a coding agent - Claude Code or OpenAI Codex - running on your own machine.
 
-You click **Hand to agent** on an issue assigned to you. boards-agent, running on your computer with your API key, picks the issue up. It puts the work on branch `agent/<KEY>` - in a separate git worktree, or in your own clone if you prefer (see [Where the agent works](#where-the-agent-works)) - and runs the agent there. When the agent is done, the issue is in Review with a summary of what changed. Nothing is pushed: you review the branch and push it yourself.
+You click **Hand to agent** on an issue assigned to you. boards-agent, running on your computer with your API key, picks the issue up. It puts the work on branch `agent/<KEY>-<title>` (e.g. `agent/BRD-314-sort-epics-in-space-detail-page`; a re-run of the issue reuses its branch even if the issue was renamed) - in a separate git worktree, or in your own clone if you prefer (see [Where the agent works](#where-the-agent-works)) - and runs the agent there. When the agent is done, the issue is in Review with a summary of what changed. Nothing is pushed: you review the branch and push it yourself.
 
 ## How it works
 
 1. boards-agent polls `list_agent_runs` for Ready runs on issues assigned to you, in every space. A space's repositories are the links on the space in Boards (space settings) whose URL matches the git remote of a clone under your code folder - so adding a repository is adding a link in Boards; nothing is mapped by hand. A run in a space with no repository cloned on this machine is left for another machine.
-2. It claims a run, which the server only allows for the assignee's own key and not while the issue is blocked. It moves the issue to the epic's first In Progress status, fetches the base branch (e.g. `origin/main`) and creates the worktree. A space with several repositories gets a folder with a worktree per repository, all on `agent/<KEY>`; the agent changes the ones the issue needs, and the others are removed when the run ends. The agent also gets the space's description and links as context.
+2. It claims a run, which the server only allows for the assignee's own key and not while the issue is blocked. It moves the issue to the epic's first In Progress status, fetches the base branch (e.g. `origin/main`) and creates the worktree. A space with several repositories gets a folder with a worktree per repository, all on the issue's branch; the agent changes the ones the issue needs, and the others are removed when the run ends. The agent also gets the space's description and links as context.
 3. It starts `claude -p` in the worktree with the bundled `work-on-issue` skill. The skill:
    - reads the issue, its comments and its links
    - posts a plan, commits on the branch, and runs the build and tests
    - posts a summary, moves the issue to Review, and finishes the run
-4. While the agent works, boards-agent checks for a cancel every 30 s and stops the agent if the run was cancelled or the timeout passed.
+4. While the agent works, boards-agent checks for a cancel every 30 s and stops the agent if the run was cancelled or the timeout passed. A dropped connection to Boards is retried at the next check, not the end of the run. If boards-agent itself stops while the agent works (a crash, a restart of the computer), it fails that run as soon as it starts again, with a comment saying which branches have commits, so the issue isn't left locked.
 
 While a run is open, the issue is locked: it can't be edited or deleted. Status changes and comments still work, and anyone with edit rights can cancel the run.
 
@@ -21,7 +21,7 @@ While a run is open, the issue is locked: it can't be edited or deleted. Status 
 Setup asks; the `workspace` setting in the config holds the answer.
 
 - **`worktree`** (the default): a separate git worktree per issue under `worktreeFolder` (`~/boards-agent-worktrees`). Your clones aren't touched, so you can keep working in them while the agent works. Branches without commits are removed when the run ends.
-- **`checkout`**: your own clones, one issue at a time. For each of the space's repositories, boards-agent fetches the default branch and switches the clone to a new branch `agent/<KEY>` from it (your local `main` isn't touched). When the run ends, the clones the agent committed to stay on `agent/<KEY>`: open them in your IDE, run the app and review as you always do. The others go back to the branch they were on.
+- **`checkout`**: your own clones, one issue at a time. For each of the space's repositories, boards-agent fetches the default branch and switches the clone to the issue's new branch from it (your local `main` isn't touched). When the run ends, the clones the agent committed to stay on that branch: open them in your IDE, run the app and review as you always do. The others go back to the branch they were on, and their empty branch is deleted.
 
   Before switching, boards-agent checks every clone. If one has uncommitted changes or isn't on its default branch (for example, it's still on the previous issue's branch while you review it), it asks you first: in the terminal, or with a dialog when it runs in the background.
   - **Continue**: checks again. A clone that still has uncommitted changes makes it ask again: your changes are never stashed or discarded, so commit or stash them yourself. A clean clone on another branch is switched, and that branch's commits stay where they are.

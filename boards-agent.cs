@@ -87,58 +87,83 @@ Log.Info($"Watching your Ready runs in every space; repositories are looked up u
     + (options.DryRun ? " Dry run - nothing is claimed." : $" {codingAgent.Name}: {codingAgent.FindExecutable()}"));
 
 var spaces = new SpaceResolver(boards, config, new CloneIndex(config.CodeFolders));
-var runner = new Runner(boards, config, codingAgent, apiKey);
+var runner = new Runner(boards, config, codingAgent, apiKey, RunsInProgress.PathFor(options.ConfigPath));
 // Runs skipped for having no repository here, so each is logged once rather than every poll.
 var skippedRuns = new HashSet<long>();
 // Checkout mode: runs the person said "Not now" to, and when to ask about them again.
 var postponedRuns = new Dictionary<long, DateTime>();
+// Boards not answering (a dropped connection, a deploy) is logged and retried at the next poll. Several failures in a row
+// end the process, so the service restarts it with a fresh connection - an MCP session doesn't survive a server restart.
+const int MaxFailuresInARow = 5;
+var failuresInARow = 0;
 try
 {
     while (!stop.IsCancellationRequested)
     {
         var worked = false;
-        var runs = await boards.ListReadyRuns(spaceKey: null, me.User.Id, stop.Token);
-        var resolved = new Dictionary<string, SpaceContext>();
-        foreach (var run in runs)
+        try
         {
-            var spaceKey = IssueKeys.SpaceKey(run.IssueKey);
-            if (!resolved.TryGetValue(spaceKey, out var space))
+            if (!options.DryRun)
             {
-                space = await spaces.Resolve(spaceKey, stop.Token);
-                resolved[spaceKey] = space;
+                await runner.FailInterruptedRun(stop.Token);
             }
 
-            if (space.Repos.Count == 0)
+            var runs = await boards.ListReadyRuns(spaceKey: null, me.User.Id, stop.Token);
+            var resolved = new Dictionary<string, SpaceContext>();
+            foreach (var run in runs)
             {
-                if (skippedRuns.Add(run.Id))
+                var spaceKey = IssueKeys.SpaceKey(run.IssueKey);
+                if (!resolved.TryGetValue(spaceKey, out var space))
                 {
-                    var links = space.OtherLinks.Count == 0 ? "the space has no links" : $"links: {string.Join(", ", space.OtherLinks.Select(x => x.Url))}";
-                    Log.Info($"{run.IssueKey}: Ready, but none of {spaceKey}'s repositories is cloned under {string.Join(", ", config.CodeFolders)} ({links}) - left for another machine.");
+                    space = await spaces.Resolve(spaceKey, stop.Token);
+                    resolved[spaceKey] = space;
                 }
 
-                continue;
+                if (space.Repos.Count == 0)
+                {
+                    if (skippedRuns.Add(run.Id))
+                    {
+                        var links = space.OtherLinks.Count == 0 ? "the space has no links" : $"links: {string.Join(", ", space.OtherLinks.Select(x => x.Url))}";
+                        Log.Info($"{run.IssueKey}: Ready, but none of {spaceKey}'s repositories is cloned under {string.Join(", ", config.CodeFolders)} ({links}) - left for another machine.");
+                    }
+
+                    continue;
+                }
+
+                if (postponedRuns.TryGetValue(run.Id, out var askAgainAt) && DateTime.UtcNow < askAgainAt)
+                {
+                    continue;
+                }
+
+                Log.Info($"{spaceKey}: Ready run {run.Id} for {run.IssueKey} \"{run.IssueTitle}\" (handed off by {run.CreatedBy} at {run.CreatedAt:u}), repositories: {string.Join(", ", space.Repos.Select(x => x.Name))}.");
+                if (!options.DryRun && config.InCheckouts && !CheckoutsReady(space, run))
+                {
+                    postponedRuns[run.Id] = DateTime.UtcNow.AddMinutes(10);
+                    Log.Info($"{run.IssueKey}: not now - asking again in 10 minutes.");
+                    continue;
+                }
+
+                postponedRuns.Remove(run.Id);
+                if (!options.DryRun && await runner.TryProcess(space, run, stop.Token))
+                {
+                    // One run at a time: poll again from the start once it's over.
+                    worked = true;
+                    break;
+                }
             }
 
-            if (postponedRuns.TryGetValue(run.Id, out var askAgainAt) && DateTime.UtcNow < askAgainAt)
+            failuresInARow = 0;
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            failuresInARow++;
+            if (failuresInARow >= MaxFailuresInARow)
             {
-                continue;
+                Log.Error($"Boards failed {failuresInARow} times in a row ({e.Message}) - exiting so the service starts again with a new connection.");
+                return 1;
             }
 
-            Log.Info($"{spaceKey}: Ready run {run.Id} for {run.IssueKey} \"{run.IssueTitle}\" (handed off by {run.CreatedBy} at {run.CreatedAt:u}), repositories: {string.Join(", ", space.Repos.Select(x => x.Name))}.");
-            if (!options.DryRun && config.InCheckouts && !CheckoutsReady(space, run))
-            {
-                postponedRuns[run.Id] = DateTime.UtcNow.AddMinutes(10);
-                Log.Info($"{run.IssueKey}: not now - asking again in 10 minutes.");
-                continue;
-            }
-
-            postponedRuns.Remove(run.Id);
-            if (!options.DryRun && await runner.TryProcess(space, run, stop.Token))
-            {
-                // One run at a time: poll again from the start once it's over.
-                worked = true;
-                break;
-            }
+            Log.Error($"Couldn't reach Boards ({e.GetType().Name}: {e.Message}) - trying again in {config.PollIntervalSeconds} s.");
         }
 
         if (options.Once)
@@ -175,7 +200,7 @@ static bool CheckoutsReady(SpaceContext space, AgentRunSummary run)
 
         Log.Info($"{run.IssueKey}: asking before switching the clones - {string.Join("; ", problems.Select(x => x.Text))}.");
         var message = $"""
-            {run.IssueKey} "{run.IssueTitle}" is ready for the agent, which will work in your clones on branch agent/{run.IssueKey}.
+            {run.IssueKey} "{run.IssueTitle}" is ready for the agent, which will work in your clones on branch {Workspaces.BranchName(space, run.IssueKey, run.IssueTitle)}.
 
             {string.Join("\n", problems.Select(x => x.Text))}
 
@@ -191,7 +216,8 @@ static bool CheckoutsReady(SpaceContext space, AgentRunSummary run)
 }
 
 /// <summary>Takes one run from claim to finish.</summary>
-sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codingAgent, string apiKey)
+/// <param name="runFilePath">Where the run in progress is recorded (<see cref="RunsInProgress"/>).</param>
+sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codingAgent, string apiKey, string runFilePath)
 {
     private const int MaxReasonLength = 4096;
 
@@ -205,6 +231,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
         }
 
         Log.Info($"{run.IssueKey}: claimed run {run.Id}.");
+        RunsInProgress.Save(runFilePath, new RunInProgress(run.Id, run.IssueKey, Workspace: null));
         Workspace workspace;
         try
         {
@@ -212,13 +239,14 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
             var inProgress = statuses.Statuses.First(x => x.CategoryId == StatusCategories.InProgress);
 
             workspace = config.InCheckouts
-                ? Workspaces.CreateInCheckouts(space, run.IssueKey)
-                : Workspaces.Create(space, config.WorktreeFolder, run.IssueKey);
+                ? Workspaces.CreateInCheckouts(space, run.IssueKey, run.IssueTitle)
+                : Workspaces.Create(space, config.WorktreeFolder, run.IssueKey, run.IssueTitle);
             Log.Info(workspace.InCheckouts
                 ? $"{run.IssueKey}: {string.Join(", ", workspace.Repos.Select(x => x.Path))} switched to branch {workspace.Branch}."
                 : workspace.IsMultiRepo
                     ? $"{run.IssueKey}: workspace {workspace.Path} with {string.Join(", ", workspace.Repos.Select(x => x.Name))} on branch {workspace.Branch}."
                     : $"{run.IssueKey}: worktree {workspace.Path} on branch {workspace.Branch}.");
+            RunsInProgress.Save(runFilePath, new RunInProgress(run.Id, run.IssueKey, RunInProgressWorkspace.Of(workspace)));
 
             var where = workspace.IsMultiRepo || workspace.InCheckouts
                 ? $"branch `{workspace.Branch}` in {string.Join(", ", workspace.Repos.Select(x => x.Name))}"
@@ -234,11 +262,48 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
         {
             Log.Error($"{run.IssueKey}: {e.Message}");
             await Fail(run, "Couldn't start the work", e.Message);
+            RunsInProgress.Clear(runFilePath);
             return true;
         }
 
+        // Not in a finally: when Work throws, the record stays, so FailInterruptedRun finishes the run.
         await Work(run, workspace, ct);
+        RunsInProgress.Clear(runFilePath);
         return true;
+    }
+
+    /// <summary>
+    /// Fails the run this machine was working on when the runner stopped without finishing it - it crashed, the computer
+    /// restarted, or Boards stopped answering - so the issue isn't left locked. The agent stopped with the runner (it's
+    /// in its process group). A run that ended meanwhile is just forgotten.
+    /// </summary>
+    public async Task FailInterruptedRun(CancellationToken ct)
+    {
+        if (RunsInProgress.Load(runFilePath) is not { } saved)
+        {
+            return;
+        }
+
+        var issue = await boards.GetIssue(saved.IssueKey, ct);
+        if (issue.LatestAgentRun is { } run && run.Id == saved.RunId && run.State == AgentRunStates.Working)
+        {
+            Log.Info($"{saved.IssueKey}: run {saved.RunId} was still Working when the runner stopped - failing it.");
+            var branches = "";
+            if (saved.Workspace?.ToWorkspace(saved.IssueKey) is { } workspace)
+            {
+                var changed = Workspaces.Finish(workspace);
+                branches = changed.Count == 0
+                    ? "\n\nNo repository got commits."
+                    : "\n\nBranches with commits:\n" + string.Join("\n", changed.Select(x => $"- {x}"));
+            }
+
+            await Fail(
+                run,
+                "The runner stopped during the work",
+                $"boards-agent on {Environment.MachineName} stopped while the agent was working (it crashed or was restarted), so the work was cut off. What the agent did so far stays on its branch." + branches);
+        }
+
+        RunsInProgress.Clear(runFilePath);
     }
 
     /// <summary>
@@ -298,7 +363,18 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
                 return;
             }
 
-            var state = await GetRunState(run, ct);
+            string? state;
+            try
+            {
+                state = await GetRunState(run, ct);
+            }
+            catch (Exception e) when (e is not OperationCanceledException)
+            {
+                // A dropped connection mustn't end the run: the agent keeps working, the next check tries again.
+                Log.Error($"{run.IssueKey}: couldn't check the run ({e.GetType().Name}: {e.Message}) - checking again in {config.CancelCheckSeconds} s.");
+                continue;
+            }
+
             if (state == AgentRunStates.Cancelled)
             {
                 agent.Kill();
@@ -1286,11 +1362,123 @@ sealed record WorkspaceRepo(
     string? Description,
     string? PreviousBranch = null);
 
+/// <summary>The run this machine is working on, see <see cref="RunsInProgress"/>.</summary>
+/// <param name="Workspace">Null until the workspace exists.</param>
+sealed record RunInProgress(long RunId, string IssueKey, RunInProgressWorkspace? Workspace);
+
+/// <summary>What <see cref="Workspaces.Finish"/> needs of a <see cref="Workspace"/>, to put it back after a crash.</summary>
+sealed record RunInProgressWorkspace(string Path, string Branch, bool InCheckouts, IReadOnlyList<WorkspaceRepo> Repos)
+{
+    public static RunInProgressWorkspace Of(Workspace workspace)
+    {
+        return new RunInProgressWorkspace(workspace.Path, workspace.Branch, workspace.InCheckouts, workspace.Repos);
+    }
+
+    public Workspace ToWorkspace(string issueKey)
+    {
+        var space = new SpaceContext(IssueKeys.SpaceKey(issueKey), Name: null, Description: null, Repos: [], OtherLinks: []);
+        return new Workspace(Path, Branch, Repos, space, InCheckouts);
+    }
+}
+
+/// <summary>
+/// The run in progress, in a file next to the config (current-run.json): written when a run is claimed, removed when
+/// it ends. Still there when the runner starts means the last run was cut off (<see cref="Runner.FailInterruptedRun"/>).
+/// </summary>
+static class RunsInProgress
+{
+    public static string PathFor(string configPath)
+    {
+        return Path.Combine(Path.GetDirectoryName(Path.GetFullPath(configPath))!, "current-run.json");
+    }
+
+    public static void Save(string path, RunInProgress run)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, JsonSerializer.Serialize(run, RunnerJson.Default.RunInProgress));
+    }
+
+    /// <summary>The recorded run, or null when there's none or the file can't be read.</summary>
+    public static RunInProgress? Load(string path)
+    {
+        try
+        {
+            return File.Exists(path)
+                ? JsonSerializer.Deserialize(File.ReadAllText(path), RunnerJson.Default.RunInProgress)
+                : null;
+        }
+        catch (Exception e) when (e is IOException or JsonException)
+        {
+            Log.Error($"{path} can't be read ({e.Message}) - ignoring it.");
+            Clear(path);
+            return null;
+        }
+    }
+
+    public static void Clear(string path)
+    {
+        File.Delete(path);
+    }
+}
+
 static class Workspaces
 {
-    public static Workspace Create(SpaceContext space, string worktreeFolder, string issueKey)
+    /// <summary>How long the title part of a new branch name can get, e.g. agent/BRD-314-sort-epics-in-space-detail-page.</summary>
+    private const int MaxSlugLength = 40;
+
+    /// <summary>
+    /// The issue's branch: the one an earlier run left in any of the space's repositories - found by the issue key, so
+    /// renaming the issue doesn't start a new branch - else agent/KEY-slug-of-the-title.
+    /// </summary>
+    public static string BranchName(SpaceContext space, string issueKey, string issueTitle)
     {
-        var branch = $"agent/{issueKey}";
+        var prefix = $"agent/{issueKey}";
+        foreach (var repo in space.Repos)
+        {
+            if (Git.FindBranch(repo.ClonePath, prefix) is { } existing)
+            {
+                return existing;
+            }
+        }
+
+        var slug = Slug(issueTitle);
+        return slug.Length == 0 ? prefix : $"{prefix}-{slug}";
+    }
+
+    /// <summary>
+    /// Lower-case ASCII words of <paramref name="title"/> joined by hyphens, accents dropped, cut at a word boundary to
+    /// <see cref="MaxSlugLength"/>. Empty when the title has no ASCII letters or digits (e.g. it's in Cyrillic).
+    /// </summary>
+    public static string Slug(string title)
+    {
+        var builder = new System.Text.StringBuilder();
+        foreach (var c in title.Normalize(System.Text.NormalizationForm.FormD))
+        {
+            if (char.IsAsciiLetterOrDigit(c))
+            {
+                builder.Append(char.ToLowerInvariant(c));
+            }
+            else if (System.Globalization.CharUnicodeInfo.GetUnicodeCategory(c) != System.Globalization.UnicodeCategory.NonSpacingMark
+                && builder.Length > 0
+                && builder[^1] != '-')
+            {
+                builder.Append('-');
+            }
+        }
+
+        var slug = builder.ToString().Trim('-');
+        if (slug.Length <= MaxSlugLength)
+        {
+            return slug;
+        }
+
+        var cut = slug.LastIndexOf('-', MaxSlugLength);
+        return cut > 0 ? slug[..cut] : slug[..MaxSlugLength];
+    }
+
+    public static Workspace Create(SpaceContext space, string worktreeFolder, string issueKey, string issueTitle)
+    {
+        var branch = BranchName(space, issueKey, issueTitle);
         var root = Path.Combine(worktreeFolder, issueKey);
         if (space.Repos.Count == 1)
         {
@@ -1322,9 +1510,9 @@ static class Workspaces
     /// default branch, or the one an earlier run of the issue left. <see cref="Checkouts.Problems"/> was asked about
     /// before; a clone that got uncommitted changes since is refused, never carried over to the issue's branch.
     /// </summary>
-    public static Workspace CreateInCheckouts(SpaceContext space, string issueKey)
+    public static Workspace CreateInCheckouts(SpaceContext space, string issueKey, string issueTitle)
     {
-        var branch = $"agent/{issueKey}";
+        var branch = BranchName(space, issueKey, issueTitle);
         foreach (var repo in space.Repos)
         {
             if (Git.UncommittedFiles(repo.ClonePath) > 0)
@@ -1364,7 +1552,7 @@ static class Workspaces
             var left = uncommitted == 0 ? "" : $", {uncommitted} uncommitted file{(uncommitted == 1 ? "" : "s")} left";
             if (commits == 0 && uncommitted == 0 && repo.PreviousBranch is { } previous)
             {
-                Git.SwitchBack(repo.Path, previous, workspace.Branch);
+                Git.SwitchBack(repo.Path, previous, workspace.Branch, repo.BaseCommit!);
             }
             else if (commits < 0)
             {
@@ -1400,7 +1588,7 @@ static class Workspaces
             }
             else
             {
-                Git.RemoveWorktree(repo.ClonePath, repo.Path, workspace.Branch);
+                Git.RemoveWorktree(repo.ClonePath, repo.Path, workspace.Branch, repo.BaseCommit!);
             }
         }
 
@@ -1584,14 +1772,45 @@ static class Git
     }
 
     /// <summary>
-    /// Checkout mode: back to <paramref name="previous"/> and deletes <paramref name="branch"/> with <c>-d</c>, which
-    /// refuses to drop unmerged commits. Best effort: what's left is only clutter.
+    /// Checkout mode: back to <paramref name="previous"/> and deletes <paramref name="branch"/> if it's still empty
+    /// (<see cref="DeleteBranchIfEmpty"/>). Best effort: what's left is only clutter.
     /// </summary>
-    public static void SwitchBack(string repo, string previous, string branch)
+    public static void SwitchBack(string repo, string previous, string branch, string baseCommit)
     {
         if (Run(repo, ["switch", previous], throwOnError: false).ExitCode == 0)
         {
-            Run(repo, ["branch", "-d", branch], throwOnError: false);
+            DeleteBranchIfEmpty(repo, branch, baseCommit);
+        }
+    }
+
+    /// <summary>
+    /// The newest local branch named <paramref name="prefix"/> or <paramref name="prefix"/>-something, e.g. an earlier
+    /// run's agent/BRD-314 or agent/BRD-314-sort-epics; null when there's none.
+    /// </summary>
+    public static string? FindBranch(string repo, string prefix)
+    {
+        var result = Run(
+            repo,
+            ["for-each-ref", "--sort=-committerdate", "--format=%(refname:short)", $"refs/heads/{prefix}", $"refs/heads/{prefix}-*"],
+            throwOnError: false);
+        return result.ExitCode == 0
+            ? result.Output
+                .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .FirstOrDefault(x => x == prefix || x.StartsWith($"{prefix}-", StringComparison.Ordinal))
+            : null;
+    }
+
+    /// <summary>
+    /// Deletes <paramref name="branch"/> when it has no commits beyond <paramref name="baseCommit"/>, what the run
+    /// started from. Not <c>branch -d</c>: that compares with the local default branch, which may be behind the remote
+    /// one the branch started from, and then refuses to delete an empty branch.
+    /// </summary>
+    private static void DeleteBranchIfEmpty(string repo, string branch, string baseCommit)
+    {
+        var result = Run(repo, ["rev-list", "--count", $"{baseCommit}..refs/heads/{branch}"], throwOnError: false);
+        if (result.ExitCode == 0 && result.Output.Trim() == "0")
+        {
+            Run(repo, ["branch", "-D", branch], throwOnError: false);
         }
     }
 
@@ -1626,13 +1845,15 @@ static class Git
     }
 
     /// <summary>
-    /// Removes a worktree and its branch. The branch with <c>-d</c>, which refuses to drop commits not merged anywhere -
-    /// a last guard against losing work. Best effort: what's left is only clutter.
+    /// Removes a worktree and its branch if it's still empty (<see cref="DeleteBranchIfEmpty"/>). A worktree with
+    /// uncommitted changes isn't removed, and so neither is its branch. Best effort: what's left is only clutter.
     /// </summary>
-    public static void RemoveWorktree(string repo, string worktree, string branch)
+    public static void RemoveWorktree(string repo, string worktree, string branch, string baseCommit)
     {
-        Run(repo, ["worktree", "remove", worktree], throwOnError: false);
-        Run(repo, ["branch", "-d", branch], throwOnError: false);
+        if (Run(repo, ["worktree", "remove", worktree], throwOnError: false).ExitCode == 0)
+        {
+            DeleteBranchIfEmpty(repo, branch, baseCommit);
+        }
     }
 
     /// <summary>The checkout's remotes, normalized (<see cref="RepoUrl"/>).</summary>
@@ -2245,6 +2466,7 @@ sealed record IssueDetail(string Key, string Title, string Status, long? StatusI
 [JsonSerializable(typeof(IReadOnlyList<EpicStatusSummary>))]
 [JsonSerializable(typeof(IssueDetail))]
 [JsonSerializable(typeof(bool))]
+[JsonSerializable(typeof(RunInProgress))]
 partial class RunnerJson : JsonSerializerContext;
 
 /// <summary>
