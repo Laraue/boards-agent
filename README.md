@@ -2,7 +2,7 @@
 
 Hand a [Laraue Boards](https://boards.laraue.com) issue to a coding agent - Claude Code or OpenAI Codex - running on your own machine.
 
-You click **Hand to agent** on an issue assigned to you. boards-agent, running on your computer with your API key, picks the issue up. It creates a git worktree on branch `agent/<KEY>` and runs the agent there. When the agent is done, the issue is in Review with a summary of what changed. Nothing is pushed: you review the branch and push it yourself.
+You click **Hand to agent** on an issue assigned to you. boards-agent, running on your computer with your API key, picks the issue up. It puts the work on branch `agent/<KEY>` - in a separate git worktree, or in your own clone if you prefer (see [Where the agent works](#where-the-agent-works)) - and runs the agent there. When the agent is done, the issue is in Review with a summary of what changed. Nothing is pushed: you review the branch and push it yourself.
 
 ## How it works
 
@@ -15,6 +15,19 @@ You click **Hand to agent** on an issue assigned to you. boards-agent, running o
 4. While the agent works, boards-agent checks for a cancel every 30 s and stops the agent if the run was cancelled or the timeout passed.
 
 While a run is open, the issue is locked: it can't be edited or deleted. Status changes and comments still work, and anyone with edit rights can cancel the run.
+
+## Where the agent works
+
+Setup asks; the `workspace` setting in the config holds the answer.
+
+- **`worktree`** (the default): a separate git worktree per issue under `worktreeFolder` (`~/boards-agent-worktrees`). Your clones aren't touched, so you can keep working in them while the agent works. Branches without commits are removed when the run ends.
+- **`checkout`**: your own clones, one issue at a time. For each of the space's repositories, boards-agent fetches the default branch and switches the clone to a new branch `agent/<KEY>` from it (your local `main` isn't touched). When the run ends, the clones the agent committed to stay on `agent/<KEY>`: open them in your IDE, run the app and review as you always do. The others go back to the branch they were on.
+
+  Before switching, boards-agent checks every clone. If one has uncommitted changes or isn't on its default branch (for example, it's still on the previous issue's branch while you review it), it asks you first: in the terminal, or with a dialog when it runs in the background.
+  - **Continue**: checks again. A clone that still has uncommitted changes makes it ask again: your changes are never stashed or discarded, so commit or stash them yourself. A clean clone on another branch is switched, and that branch's commits stay where they are.
+  - **Not now**: the run stays Ready, and you're asked again in 10 minutes. A dialog nobody answers counts as Not now after 10 minutes.
+
+  Claude Code starts in the first repository and gets the others with `--add-dir`; Codex gets them as writable folders of its sandbox. Don't edit those clones while the agent works in them.
 
 ## Safety
 
@@ -52,8 +65,9 @@ Run `boards-agent setup`, ideally from inside the repository you want the agent 
 1. Picks the coding agent: the one you have installed, or asks when you have both.
 2. Opens Boards in your browser. Check the code, pick the organization and click **Allow**. Boards creates an API key named after the agent and your machine, e.g. "Claude Code agent (MacBook)", and hands it to the runner, which keeps it in the Keychain. You can revoke the key any time under Account -> API keys.
 3. Asks where you keep your code (e.g. `~/Repos`) and shows, per space, which of its repositories it found there by git remote, and which aren't cloned. New branches start from each remote's default branch (e.g. `origin/main`). If no space links to a repository yet, add the repository's URL as a link on the space in Boards, or map one by hand.
-4. Signs the agent in if it isn't (`claude auth login` or `codex login`).
-5. Offers to run the agent in the background (macOS and Windows), so there's no terminal to keep open. After that, clicking **Hand to agent** in Boards is all there is to it.
+4. Asks where the agent should work: a worktree per issue, or your own clones (see [Where the agent works](#where-the-agent-works)).
+5. Signs the agent in if it isn't (`claude auth login` or `codex login`).
+6. Offers to run the agent in the background (macOS and Windows), so there's no terminal to keep open. After that, clicking **Hand to agent** in Boards is all there is to it.
 
 The answers go to `~/.config/boards-agent/config.json` (`%APPDATA%\boards-agent\config.json` on Windows), which the runner reads by default. Running setup again keeps what's there. Use `--no-browser` to just print the link, e.g. over SSH. `--config <file>` points both setup and the runner at another config file; `boards-agent.example.json` lists every setting. Setting `BOARDS_AGENT_API_KEY` overrides the stored key.
 

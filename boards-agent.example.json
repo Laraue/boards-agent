@@ -15,8 +15,11 @@
   "spaces": {
     "BRD": { "repo": "~/Repos/my-project", "baseRef": "origin/main" }
   },
-  // Where the worktrees go: <worktreeFolder>/<KEY>.
+  // Where the worktrees go: <worktreeFolder>/<KEY>. The agents' logs go here in both workspace modes.
   "worktreeFolder": "~/boards-agent-worktrees",
+  // Where the agent works: "worktree" (a worktree per issue) or "checkout" (your own clones, one issue at a time;
+  // it asks before switching a clone with uncommitted changes or on another branch).
+  "workspace": "worktree",
   // The coding agent: "claude" (Claude Code) or "codex" (OpenAI Codex). Setup asks when both are installed.
   "agent": "claude",
   // "claude" = the one on PATH, or else the newest one bundled with the Claude desktop app.

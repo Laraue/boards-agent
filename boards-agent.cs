@@ -2950,10 +2950,13 @@ static class Setup
             }
         }
 
+        // 4. Where the agent works: separate worktrees, or your own clones.
+        config = config with { Workspace = ChooseWorkspace(config) };
+
         config.Save(options.ConfigPath);
         Console.WriteLine($"Saved {options.ConfigPath}.");
 
-        // 4. The coding agent's own sign-in.
+        // 5. The coding agent's own sign-in.
         string executable;
         try
         {
@@ -3047,6 +3050,34 @@ static class Setup
             }
 
             Console.WriteLine($"Enter a number from 1 to {installed.Count}.");
+        }
+    }
+
+    /// <summary>The workspace mode (<see cref="RunnerConfig.Workspace"/>), the config's current one by default.</summary>
+    private static string ChooseWorkspace(RunnerConfig config)
+    {
+        string[] modes = [WorkspaceModes.Worktree, WorkspaceModes.Checkout];
+        var current = config.InCheckouts ? 2 : 1;
+        Console.WriteLine();
+        Console.WriteLine("Where should the agent work?");
+        Console.WriteLine($"  1. In a separate git worktree per issue under {config.WorktreeFolder} - your clones aren't touched.");
+        Console.WriteLine("  2. In your own clones, one issue at a time: each switched to a new branch from the fetched default branch,");
+        Console.WriteLine("     so you review and run the result where you always work. Before switching a clone that has uncommitted");
+        Console.WriteLine("     changes or is on another branch, the agent asks you first.");
+        while (true)
+        {
+            var answer = Ask($"Number, or Enter for {current}:");
+            if (answer.Length == 0)
+            {
+                return modes[current - 1];
+            }
+
+            if (int.TryParse(answer, out var number) && number is 1 or 2)
+            {
+                return modes[number - 1];
+            }
+
+            Console.WriteLine("Enter 1 or 2.");
         }
     }
 
