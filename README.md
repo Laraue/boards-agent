@@ -6,8 +6,8 @@ You click **Hand to agent** on an issue assigned to you. boards-agent, running o
 
 ## How it works
 
-1. boards-agent polls `list_agent_runs` for Ready runs on issues assigned to you, in the spaces you mapped to local repositories.
-2. It claims a run, which the server only allows for the assignee's own key and not while the issue is blocked. It moves the issue to the epic's first In Progress status, fetches the base branch (e.g. `origin/main`) and creates the worktree.
+1. boards-agent polls `list_agent_runs` for Ready runs on issues assigned to you, in every space. A space's repositories are the links on the space in Boards (space settings) whose URL matches the git remote of a clone under your code folder - so adding a repository is adding a link in Boards; nothing is mapped by hand. A run in a space with no repository cloned on this machine is left for another machine.
+2. It claims a run, which the server only allows for the assignee's own key and not while the issue is blocked. It moves the issue to the epic's first In Progress status, fetches the base branch (e.g. `origin/main`) and creates the worktree. A space with several repositories gets a folder with a worktree per repository, all on `agent/<KEY>`; the agent changes the ones the issue needs, and the others are removed when the run ends. The agent also gets the space's description and links as context.
 3. It starts `claude -p` in the worktree with the bundled `work-on-issue` skill. The skill:
    - reads the issue, its comments and its links
    - posts a plan, commits on the branch, and runs the build and tests
@@ -51,7 +51,7 @@ Run `boards-agent setup`, ideally from inside the repository you want the agent 
 
 1. Picks the coding agent: the one you have installed, or asks when you have both.
 2. Opens Boards in your browser. Check the code, pick the organization and click **Allow**. Boards creates an API key named after the agent and your machine, e.g. "Claude Code agent (MacBook)", and hands it to the runner, which keeps it in the Keychain. You can revoke the key any time under Account -> API keys.
-3. Asks which space's issues are worked on in which local repository, offering the one you ran it in. New branches start from the remote's default branch (e.g. `origin/main`).
+3. Asks where you keep your code (e.g. `~/Repos`) and shows, per space, which of its repositories it found there by git remote, and which aren't cloned. New branches start from each remote's default branch (e.g. `origin/main`). If no space links to a repository yet, add the repository's URL as a link on the space in Boards, or map one by hand.
 4. Signs the agent in if it isn't (`claude auth login` or `codex login`).
 5. Offers to run the agent in the background (macOS and Windows), so there's no terminal to keep open. After that, clicking **Hand to agent** in Boards is all there is to it.
 

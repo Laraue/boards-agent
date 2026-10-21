@@ -8,8 +8,10 @@
   "organizationId": 1,
   // When this environment variable is set, it overrides the stored key. Claude Code receives the key through it.
   "apiKeyEnv": "BOARDS_AGENT_API_KEY",
-  // Space key -> the local repository its issues are worked on in. Only these spaces are polled.
-  // Each issue gets a worktree on branch agent/<KEY>, started from baseRef (default HEAD); the checkout itself isn't touched.
+  // Where your clones are (searched three levels deep). A space's repositories are its links in Boards whose URL
+  // matches a clone's git remote; each issue gets a worktree per repository on branch agent/<KEY>.
+  "codeFolders": ["~/Repos"],
+  // Optional: a repository mapped to a space by hand, for one the space has no link to.
   "spaces": {
     "BRD": { "repo": "~/Repos/my-project", "baseRef": "origin/main" }
   },
