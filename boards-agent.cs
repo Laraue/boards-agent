@@ -3110,24 +3110,29 @@ static class Setup
     }
 
     /// <summary>
-    /// Asks which space goes with which repository, starting with the git checkout setup runs in. Existing mappings stay.
-    /// </summary>
-    /// <summary>
-    /// The folder the code is cloned under. Suggested: the one already configured, else the folder holding the checkout
-    /// setup runs in (its main checkout, not a worktree), else ~/Repos.
+    /// The folder the code is cloned under, as the person types it - nothing is guessed. Enter keeps the folder
+    /// configured before.
     /// </summary>
     private static string AskCodeFolder(RunnerConfig config)
     {
-        var mainCheckout = Git.MainCheckout(Environment.CurrentDirectory);
-        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-        var suggested = config.CodeFolders.FirstOrDefault()
-            ?? (mainCheckout is null ? null : Path.GetDirectoryName(mainCheckout))
-            ?? (Directory.Exists(Path.Combine(home, "Repos")) ? Path.Combine(home, "Repos") : home);
-
+        var current = config.CodeFolders.FirstOrDefault();
         while (true)
         {
-            var answer = Ask($"Where do you keep your code? Enter for {suggested}:");
-            var folder = Paths.Expand(answer.Length == 0 ? suggested : answer);
+            var answer = Ask(current is null
+                ? "Which folder are your repositories cloned under (e.g. ~/Repos)? They're searched three levels deep:"
+                : $"Which folder are your repositories cloned under? Enter for {current}:");
+            if (answer.Length == 0 && current is null)
+            {
+                if (Console.IsInputRedirected && Console.In.Peek() < 0)
+                {
+                    throw new InvalidOperationException("No folder for the repositories was given.");
+                }
+
+                Console.WriteLine("Enter a folder.");
+                continue;
+            }
+
+            var folder = Paths.Expand(answer.Length == 0 ? current! : answer);
             if (Directory.Exists(folder))
             {
                 return folder;
