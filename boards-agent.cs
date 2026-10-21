@@ -90,6 +90,8 @@ var spaces = new SpaceResolver(boards, config, new CloneIndex(config.CodeFolders
 var runner = new Runner(boards, config, codingAgent, apiKey);
 // Runs skipped for having no repository here, so each is logged once rather than every poll.
 var skippedRuns = new HashSet<long>();
+// Checkout mode: runs the person said "Not now" to, and when to ask about them again.
+var postponedRuns = new Dictionary<long, DateTime>();
 try
 {
     while (!stop.IsCancellationRequested)
@@ -117,7 +119,20 @@ try
                 continue;
             }
 
+            if (postponedRuns.TryGetValue(run.Id, out var askAgainAt) && DateTime.UtcNow < askAgainAt)
+            {
+                continue;
+            }
+
             Log.Info($"{spaceKey}: Ready run {run.Id} for {run.IssueKey} \"{run.IssueTitle}\" (handed off by {run.CreatedBy} at {run.CreatedAt:u}), repositories: {string.Join(", ", space.Repos.Select(x => x.Name))}.");
+            if (!options.DryRun && config.InCheckouts && !CheckoutsReady(space, run))
+            {
+                postponedRuns[run.Id] = DateTime.UtcNow.AddMinutes(10);
+                Log.Info($"{run.IssueKey}: not now - asking again in 10 minutes.");
+                continue;
+            }
+
+            postponedRuns.Remove(run.Id);
             if (!options.DryRun && await runner.TryProcess(space, run, stop.Token))
             {
                 // One run at a time: poll again from the start once it's over.
@@ -144,6 +159,37 @@ catch (OperationCanceledException) when (stop.IsCancellationRequested)
 Log.Info("Stopped.");
 return 0;
 
+// Checkout mode: true once every clone of the space is clean and on its default branch, or the person said to go
+// ahead. Uncommitted changes are never touched, so "Continue" with changes still there asks again.
+static bool CheckoutsReady(SpaceContext space, AgentRunSummary run)
+{
+    var asked = false;
+    while (true)
+    {
+        var problems = Checkouts.Problems(space);
+        var uncommitted = problems.Any(x => x.HasChanges);
+        if (problems.Count == 0 || (asked && !uncommitted))
+        {
+            return true;
+        }
+
+        Log.Info($"{run.IssueKey}: asking before switching the clones - {string.Join("; ", problems.Select(x => x.Text))}.");
+        var message = $"""
+            {run.IssueKey} "{run.IssueTitle}" is ready for the agent, which will work in your clones on branch agent/{run.IssueKey}.
+
+            {string.Join("\n", problems.Select(x => x.Text))}
+
+            {(uncommitted ? "Commit or stash the changes first - they're never touched. " : "")}Continue?
+            """;
+        if (!UserPrompt.Ask(message, yes: "Continue", no: "Not now"))
+        {
+            return false;
+        }
+
+        asked = true;
+    }
+}
+
 /// <summary>Takes one run from claim to finish.</summary>
 sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codingAgent, string apiKey)
 {
@@ -165,12 +211,16 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
             var statuses = await FindEpicStatuses(space.Key, run.IssueKey, ct);
             var inProgress = statuses.Statuses.First(x => x.CategoryId == StatusCategories.InProgress);
 
-            workspace = Workspaces.Create(space, config.WorktreeFolder, run.IssueKey);
-            Log.Info(workspace.IsMultiRepo
-                ? $"{run.IssueKey}: workspace {workspace.Path} with {string.Join(", ", workspace.Repos.Select(x => x.Name))} on branch {workspace.Branch}."
-                : $"{run.IssueKey}: worktree {workspace.Path} on branch {workspace.Branch}.");
+            workspace = config.InCheckouts
+                ? Workspaces.CreateInCheckouts(space, run.IssueKey)
+                : Workspaces.Create(space, config.WorktreeFolder, run.IssueKey);
+            Log.Info(workspace.InCheckouts
+                ? $"{run.IssueKey}: {string.Join(", ", workspace.Repos.Select(x => x.Path))} switched to branch {workspace.Branch}."
+                : workspace.IsMultiRepo
+                    ? $"{run.IssueKey}: workspace {workspace.Path} with {string.Join(", ", workspace.Repos.Select(x => x.Name))} on branch {workspace.Branch}."
+                    : $"{run.IssueKey}: worktree {workspace.Path} on branch {workspace.Branch}.");
 
-            var where = workspace.IsMultiRepo
+            var where = workspace.IsMultiRepo || workspace.InCheckouts
                 ? $"branch `{workspace.Branch}` in {string.Join(", ", workspace.Repos.Select(x => x.Name))}"
                 : $"branch `{workspace.Branch}`";
             await boards.EditIssueStatus(
@@ -200,15 +250,15 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
         var logPath = Path.Combine(config.WorktreeFolder, $"{run.IssueKey}.run-{run.Id}.jsonl");
         using var agent = codingAgent.Start(apiKey, run, workspace, logPath);
 
-        // Across repositories, however the run ends: the worktrees the agent didn't commit to are removed, and the
-        // runner's comment says which branches have commits - right even if the agent's own summary misses one.
+        // However the run ends: what the agent didn't commit to is put back, and the runner's comment says which
+        // branches have commits - right even if the agent's own summary misses one.
         string? branches = null;
         string Branches()
         {
             if (branches is null)
             {
-                var changed = workspace.IsMultiRepo ? Workspaces.RemoveUnchanged(workspace) : [];
-                branches = !workspace.IsMultiRepo
+                var changed = Workspaces.Finish(workspace);
+                branches = !workspace.IsMultiRepo && !workspace.InCheckouts
                     ? ""
                     : changed.Count == 0
                         ? "\n\nNo repository got commits."
@@ -443,7 +493,12 @@ static class CodingAgents
             $"- Agent run id: {run.Id}",
         };
 
-        if (workspace.IsMultiRepo)
+        if (workspace.InCheckouts && workspace.IsMultiRepo)
+        {
+            lines.Add($"- The space's repositories, all on branch {workspace.Branch} - you start in the first. Change only the repositories the issue needs, and run git as `git -C <folder> ...`:");
+            lines.AddRange(workspace.Repos.Select(repo => $"  - {repo.Path} (from {repo.BaseRef}){Describe(repo.Url, repo.Description)}"));
+        }
+        else if (workspace.IsMultiRepo)
         {
             lines.Add($"- This folder holds one git worktree per repository of the space, all on branch {workspace.Branch}. Change only the repositories the issue needs, and run git as `git -C <folder> ...`:");
             lines.AddRange(workspace.Repos.Select(repo => $"  - {repo.Name}/ (from {repo.BaseRef}){Describe(repo.Url, repo.Description)}"));
@@ -672,6 +727,8 @@ sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
             "--setting-sources", "project",
             "--allowedTools", "Skill(boards-agent:work-on-issue)", .. AllowedCommands(workspace), .. CodingAgents.BoardsTools.Select(x => $"mcp__boards__{x}"),
             "--disallowedTools", .. DisallowedTools,
+            // In checkout mode the other clones aren't under the first one, where Claude Code starts.
+            .. workspace.Repos.Skip(1).SelectMany(repo => new[] { "--add-dir", repo.Path }),
         ];
         foreach (var argument in arguments)
         {
@@ -842,7 +899,11 @@ sealed class CodexAgent(RunnerConfig config) : ICodingAgent
             "--sandbox", "workspace-write",
             "-C", workspace.Path,
             // A workspace of several repositories isn't a git repository itself.
-            .. (workspace.IsMultiRepo ? new[] { "--skip-git-repo-check" } : []),
+            .. (workspace.IsMultiRepo && !workspace.InCheckouts ? new[] { "--skip-git-repo-check" } : []),
+            // In checkout mode the other clones aren't under the first one, the sandbox's writable folder.
+            .. (workspace.InCheckouts && workspace.IsMultiRepo
+                ? new[] { "-c", $"sandbox_workspace_write.writable_roots=[{string.Join(", ", workspace.Repos.Skip(1).Select(repo => Toml(repo.Path)))}]" }
+                : []),
             "-c", "approval_policy=\"never\"",
             "-c", "web_search=\"disabled\"",
             "-c", $"sandbox_workspace_write.network_access={(config.CodexNetworkAccess ? "true" : "false")}",
@@ -1197,10 +1258,11 @@ sealed class SpaceResolver(BoardsClient boards, RunnerConfig config, CloneIndex 
 }
 
 /// <summary>
-/// Where the agent works on one run. A space with one repository: that repository's worktree, as before. Several: a
-/// folder holding a worktree per repository, all on the same branch (BRD-312).
+/// Where the agent works on one run. In worktrees: a space with one repository is that repository's worktree; several
+/// are a folder holding a worktree per repository, all on the same branch (BRD-312). In checkouts (BRD-313): the clones
+/// themselves on the issue's branch, the agent starting in the first.
 /// </summary>
-sealed record Workspace(string Path, string Branch, IReadOnlyList<WorkspaceRepo> Repos, SpaceContext Space)
+sealed record Workspace(string Path, string Branch, IReadOnlyList<WorkspaceRepo> Repos, SpaceContext Space, bool InCheckouts)
 {
     public bool IsMultiRepo => Repos.Count > 1;
 
@@ -1208,11 +1270,12 @@ sealed record Workspace(string Path, string Branch, IReadOnlyList<WorkspaceRepo>
     public string BaseRef => Repos[0].BaseRef;
 }
 
-/// <summary>One repository's worktree in a workspace.</summary>
+/// <summary>One repository in a workspace: its worktree, or in checkout mode the clone itself.</summary>
 /// <param name="BaseCommit">
 /// What <see cref="BaseRef"/> resolved to in the clone when the workspace was made - what "commits of this run" are
 /// counted against (in the worktree, HEAD is the run's own branch).
 /// </param>
+/// <param name="PreviousBranch">In checkout mode, the branch the clone was on before, to go back to when nothing was committed.</param>
 sealed record WorkspaceRepo(
     string Name,
     string Path,
@@ -1220,7 +1283,8 @@ sealed record WorkspaceRepo(
     string BaseRef,
     string? BaseCommit,
     string? Url,
-    string? Description);
+    string? Description,
+    string? PreviousBranch = null);
 
 static class Workspaces
 {
@@ -1232,7 +1296,7 @@ static class Workspaces
         {
             var repo = space.Repos[0];
             Git.CreateWorktree(repo.ClonePath, repo.BaseRef, root, branch);
-            return new Workspace(root, branch, [ToWorkspaceRepo(repo, root)], space);
+            return new Workspace(root, branch, [ToWorkspaceRepo(repo, root)], space, InCheckouts: false);
         }
 
         if (File.Exists(Path.Combine(root, ".git")))
@@ -1250,14 +1314,76 @@ static class Workspaces
             repos.Add(ToWorkspaceRepo(repo, path));
         }
 
-        return new Workspace(root, branch, repos, space);
+        return new Workspace(root, branch, repos, space, InCheckouts: false);
+    }
+
+    /// <summary>
+    /// Checkout mode: switches each of the space's clones to the issue's branch - a new one from the freshly fetched
+    /// default branch, or the one an earlier run of the issue left. <see cref="Checkouts.Problems"/> was asked about
+    /// before; a clone that got uncommitted changes since is refused, never carried over to the issue's branch.
+    /// </summary>
+    public static Workspace CreateInCheckouts(SpaceContext space, string issueKey)
+    {
+        var branch = $"agent/{issueKey}";
+        foreach (var repo in space.Repos)
+        {
+            if (Git.UncommittedFiles(repo.ClonePath) > 0)
+            {
+                throw new InvalidOperationException($"{repo.Name} ({repo.ClonePath}) has uncommitted changes");
+            }
+        }
+
+        var repos = new List<WorkspaceRepo>();
+        foreach (var repo in space.Repos)
+        {
+            var previous = Git.CurrentBranch(repo.ClonePath);
+            Git.SwitchToBranch(repo.ClonePath, repo.BaseRef, branch);
+            repos.Add(ToWorkspaceRepo(repo, repo.ClonePath) with { PreviousBranch = previous });
+        }
+
+        return new Workspace(repos[0].Path, branch, repos, space, InCheckouts: true);
+    }
+
+    /// <summary>
+    /// After a run: puts back what the agent didn't commit to, and returns one line per repository it did, e.g.
+    /// "laraue-boards: `agent/BRD-42`, 3 commits". In worktrees, across repositories, unchanged worktrees are removed. In
+    /// checkouts, an unchanged clone goes back to its previous branch and the empty branch is deleted.
+    /// </summary>
+    public static IReadOnlyList<string> Finish(Workspace workspace)
+    {
+        if (!workspace.InCheckouts)
+        {
+            return workspace.IsMultiRepo ? RemoveUnchanged(workspace) : [];
+        }
+
+        var changed = new List<string>();
+        foreach (var repo in workspace.Repos)
+        {
+            var commits = repo.BaseCommit is null ? -1 : Git.CommitsSince(repo.Path, repo.BaseCommit);
+            var uncommitted = Git.UncommittedFiles(repo.Path);
+            var left = uncommitted == 0 ? "" : $", {uncommitted} uncommitted file{(uncommitted == 1 ? "" : "s")} left";
+            if (commits == 0 && uncommitted == 0 && repo.PreviousBranch is { } previous)
+            {
+                Git.SwitchBack(repo.Path, previous, workspace.Branch);
+            }
+            else if (commits < 0)
+            {
+                changed.Add($"{repo.Name}: `{workspace.Branch}` (couldn't count its commits){left}");
+            }
+            else if (commits > 0 || uncommitted > 0)
+            {
+                changed.Add($"{repo.Name}: `{workspace.Branch}`, {commits} commit{(commits == 1 ? "" : "s")}{left}");
+            }
+        }
+
+        return changed;
     }
 
     /// <summary>
     /// After a run across repositories: removes the worktree and branch of every repository the agent didn't commit to,
     /// and returns one line per repository it did, e.g. "laraue-boards: `agent/BRD-42`, 3 commits".
     /// </summary>
-    public static IReadOnlyList<string> RemoveUnchanged(Workspace workspace)
+    private static IReadOnlyList<string> RemoveUnchanged(Workspace workspace)
     {
         var changed = new List<string>();
         foreach (var repo in workspace.Repos)
@@ -1294,6 +1420,124 @@ static class Workspaces
     }
 }
 
+/// <summary>Checkout mode (BRD-313): what has to be asked about before the agent may switch your clones.</summary>
+static class Checkouts
+{
+    /// <summary>
+    /// One line per clone that isn't ready to be switched: uncommitted changes, or a branch other than the default one
+    /// (e.g. the previous issue's, still under review). Empty when every clone is clean and on its default branch.
+    /// </summary>
+    public static IReadOnlyList<CheckoutProblem> Problems(SpaceContext space)
+    {
+        var problems = new List<CheckoutProblem>();
+        foreach (var repo in space.Repos)
+        {
+            var uncommitted = Git.UncommittedFiles(repo.ClonePath);
+            var branch = Git.CurrentBranch(repo.ClonePath);
+            var defaultBranch = DefaultBranch(repo.BaseRef);
+            var issues = new List<string>();
+            if (uncommitted != 0)
+            {
+                issues.Add(uncommitted < 0 ? "git status failed" : $"{uncommitted} uncommitted file{(uncommitted == 1 ? "" : "s")}");
+            }
+
+            if (defaultBranch is not null && branch != defaultBranch)
+            {
+                issues.Add(branch is null ? "detached HEAD" : $"on {branch}");
+            }
+
+            if (issues.Count > 0)
+            {
+                problems.Add(new CheckoutProblem($"{repo.Name}: {string.Join(", ", issues)}", HasChanges: uncommitted != 0));
+            }
+        }
+
+        return problems;
+    }
+
+    /// <summary>The local default branch a base ref stands for: origin/main -> main; null for HEAD.</summary>
+    private static string? DefaultBranch(string baseRef)
+    {
+        var slash = baseRef.IndexOf('/');
+        return slash > 0 ? baseRef[(slash + 1)..] : null;
+    }
+}
+
+/// <summary>A clone that isn't ready to be switched. <paramref name="HasChanges"/>: it has uncommitted changes (or git couldn't tell).</summary>
+sealed record CheckoutProblem(string Text, bool HasChanges);
+
+/// <summary>
+/// Asks the person a yes/no question: in the terminal when the runner runs in one, else - as a background service - in
+/// a system dialog (macOS, Windows). Without either, the answer is no.
+/// </summary>
+static class UserPrompt
+{
+    /// <summary>A dialog nobody answers counts as no after this long, so the runner doesn't wait forever.</summary>
+    private const int DialogTimeoutSeconds = 600;
+
+    /// <summary>True for <paramref name="yes"/>, false for <paramref name="no"/> or no answer.</summary>
+    public static bool Ask(string message, string yes, string no)
+    {
+        if (!Console.IsInputRedirected)
+        {
+            Console.Write($"{message} [y/N] ");
+            return Console.ReadLine()?.Trim().ToLowerInvariant() is "y" or "yes";
+        }
+
+        if (OperatingSystem.IsMacOS())
+        {
+            return AskMac(message, yes, no);
+        }
+
+        if (OperatingSystem.IsWindows())
+        {
+            return WindowsDialog.Ask(message);
+        }
+
+        Log.Info("No terminal or dialog to ask in - taken as no.");
+        return false;
+    }
+
+    /// <summary>osascript's own dialog: a LaunchAgent runs in the person's login session, so it shows on their screen.</summary>
+    private static bool AskMac(string message, string yes, string no)
+    {
+        var info = new System.Diagnostics.ProcessStartInfo("osascript");
+        // The texts go in as arguments, not into the script, so nothing in them needs escaping.
+        foreach (var argument in new[]
+        {
+            "-e", "on run argv",
+            "-e", $"display dialog (item 1 of argv) with title \"boards-agent\" buttons {{(item 3 of argv), (item 2 of argv)}} default button 2 giving up after {DialogTimeoutSeconds}",
+            "-e", "return button returned of result",
+            "-e", "end run",
+            message, yes, no,
+        })
+        {
+            info.ArgumentList.Add(argument);
+        }
+
+        var result = Shell.Run(info);
+        return result.ExitCode == 0 && result.Output.Trim() == yes;
+    }
+}
+
+static class WindowsDialog
+{
+    private const uint YesNo = 0x4;
+    private const uint IconQuestion = 0x20;
+    private const uint Topmost = 0x40000;
+    private const uint SetForeground = 0x10000;
+    private const int Yes = 6;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "MessageBoxW", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
+    private static extern int MessageBox(IntPtr window, string text, string caption, uint type);
+
+    /// <summary>A Yes/No message box; the scheduled task runs with the person's interactive logon, so it shows on their screen.</summary>
+    public static bool Ask(string message)
+    {
+        return MessageBox(IntPtr.Zero, message, "boards-agent", YesNo | IconQuestion | Topmost | SetForeground) == Yes;
+    }
+}
+
 static class Git
 {
     /// <summary>
@@ -1319,6 +1563,52 @@ static class Git
             FetchRemoteRef(repo, baseRef);
             Run(repo, ["worktree", "add", "-b", branch, path, baseRef]);
         }
+    }
+
+    /// <summary>
+    /// Checkout mode: switches the clone to <paramref name="branch"/> - the one an earlier run of the issue left, or a
+    /// new one from <paramref name="baseRef"/> fetched just before.
+    /// </summary>
+    public static void SwitchToBranch(string repo, string baseRef, string branch)
+    {
+        var branchExists = Run(repo, ["rev-parse", "--verify", "--quiet", $"refs/heads/{branch}"], throwOnError: false).ExitCode == 0;
+        if (branchExists)
+        {
+            Run(repo, ["switch", branch]);
+        }
+        else
+        {
+            FetchRemoteRef(repo, baseRef);
+            Run(repo, ["switch", "--no-track", "-c", branch, baseRef]);
+        }
+    }
+
+    /// <summary>
+    /// Checkout mode: back to <paramref name="previous"/> and deletes <paramref name="branch"/> with <c>-d</c>, which
+    /// refuses to drop unmerged commits. Best effort: what's left is only clutter.
+    /// </summary>
+    public static void SwitchBack(string repo, string previous, string branch)
+    {
+        if (Run(repo, ["switch", previous], throwOnError: false).ExitCode == 0)
+        {
+            Run(repo, ["branch", "-d", branch], throwOnError: false);
+        }
+    }
+
+    /// <summary>The branch the checkout is on, or null when HEAD is detached.</summary>
+    public static string? CurrentBranch(string repo)
+    {
+        var result = Run(repo, ["symbolic-ref", "--quiet", "--short", "HEAD"], throwOnError: false);
+        return result.ExitCode == 0 && result.Output.Trim() is { Length: > 0 } branch ? branch : null;
+    }
+
+    /// <summary>How many files have uncommitted changes, untracked ones included; -1 when git can't tell.</summary>
+    public static int UncommittedFiles(string repo)
+    {
+        var result = Run(repo, ["status", "--porcelain"], throwOnError: false);
+        return result.ExitCode == 0
+            ? result.Output.Split('\n', StringSplitOptions.RemoveEmptyEntries).Length
+            : -1;
     }
 
     /// <summary>The commit a ref points to in the repository, or null when it doesn't resolve.</summary>
@@ -1609,8 +1899,18 @@ sealed record RunnerConfig
     /// <summary>Space key -> a repository mapped by hand, for one the space has no link to.</summary>
     public Dictionary<string, SpaceConfig> Spaces { get; set; } = [];
 
-    /// <summary>Where the runner creates a git worktree per issue.</summary>
+    /// <summary>Where the runner creates a git worktree per issue, and keeps the agents' logs.</summary>
     public string WorktreeFolder { get; set; } = "~/boards-agent-worktrees";
+
+    /// <summary>
+    /// Where the agent works (BRD-313): <see cref="WorkspaceModes.Worktree"/> - a git worktree per issue, your clones
+    /// aren't touched - or <see cref="WorkspaceModes.Checkout"/> - your own clones, switched to the issue's branch, so
+    /// you review and run the result where you always work. Checkout mode asks before touching a clone that has
+    /// uncommitted changes or isn't on its default branch.
+    /// </summary>
+    public string Workspace { get; set; } = WorkspaceModes.Worktree;
+
+    public bool InCheckouts => Workspace.Equals(WorkspaceModes.Checkout, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// The Claude Code executable. "claude" means the one on PATH, or else the newest one bundled with the Claude
@@ -1692,6 +1992,12 @@ sealed record RunnerConfig
             throw new InvalidOperationException($"{path}: no code folder to find repositories in. Run `boards-agent setup`.");
         }
 
+        if (!WorkspaceModes.All.Contains(config.Workspace, StringComparer.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"{path}: unknown workspace \"{config.Workspace}\": use \"{WorkspaceModes.Worktree}\" or \"{WorkspaceModes.Checkout}\".");
+        }
+
         return config;
     }
 
@@ -1721,7 +2027,16 @@ sealed record RunnerConfig
     }
 }
 
-/// <summary>One space's repository.</summary>
+/// <summary>Where the agent works, see <see cref="RunnerConfig.Workspace"/>.</summary>
+static class WorkspaceModes
+{
+    public const string Worktree = "worktree";
+
+    public const string Checkout = "checkout";
+
+    public static readonly string[] All = [Worktree, Checkout];
+}
+
 /// <summary>
 /// A repository mapped to a space by hand - for a repository the space has no link to. Repositories the space links to
 /// are found by themselves (<see cref="SpaceResolver"/>).
