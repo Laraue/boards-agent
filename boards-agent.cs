@@ -154,7 +154,7 @@ try
 
             failuresInARow = 0;
         }
-        catch (Exception e) when (e is not OperationCanceledException)
+        catch (Exception e) when (!stop.IsCancellationRequested)
         {
             failuresInARow++;
             if (failuresInARow >= MaxFailuresInARow)
@@ -258,7 +258,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
                 ct);
             Log.Info($"{run.IssueKey}: moved to {inProgress.Name} ({statuses.EpicName}).");
         }
-        catch (Exception e) when (e is not OperationCanceledException)
+        catch (Exception e) when (!ct.IsCancellationRequested)
         {
             Log.Error($"{run.IssueKey}: {e.Message}");
             await Fail(run, "Couldn't start the work", e.Message);
@@ -368,7 +368,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
             {
                 state = await GetRunState(run, ct);
             }
-            catch (Exception e) when (e is not OperationCanceledException)
+            catch (Exception e) when (!ct.IsCancellationRequested)
             {
                 // A dropped connection mustn't end the run: the agent keeps working, the next check tries again.
                 Log.Error($"{run.IssueKey}: couldn't check the run ({e.GetType().Name}: {e.Message}) - checking again in {config.CancelCheckSeconds} s.");
@@ -2271,12 +2271,22 @@ sealed record SpaceConfig
     public string BaseRef { get; set; } = "HEAD";
 }
 
-/// <summary>The Boards MCP tools the runner calls.</summary>
-sealed class BoardsClient(McpClient client) : IAsyncDisposable
+/// <summary>
+/// The Boards MCP tools the runner calls. A call that fails drops the connection and the next call opens a new one: an
+/// MCP session doesn't survive Boards restarting, and a broken one would fail every call after.
+/// </summary>
+sealed class BoardsClient(string url, string apiKey, McpClient connected) : IAsyncDisposable
 {
     private const int PageSize = 50;
 
+    private McpClient? _client = connected;
+
     public static async Task<BoardsClient> ConnectAsync(string url, string apiKey, CancellationToken ct)
+    {
+        return new BoardsClient(url, apiKey, await Connect(url, apiKey, ct));
+    }
+
+    private static Task<McpClient> Connect(string url, string apiKey, CancellationToken ct)
     {
         var transport = new HttpClientTransport(
             new HttpClientTransportOptions
@@ -2287,7 +2297,7 @@ sealed class BoardsClient(McpClient client) : IAsyncDisposable
                 Name = "boards-agent",
             });
 
-        return new BoardsClient(await McpClient.CreateAsync(transport, cancellationToken: ct));
+        return McpClient.CreateAsync(transport, cancellationToken: ct);
     }
 
     public Task<MeInfo> GetMe(CancellationToken ct)
@@ -2383,7 +2393,18 @@ sealed class BoardsClient(McpClient client) : IAsyncDisposable
 
     private async Task<string> CallVoid(string tool, IReadOnlyDictionary<string, object?> arguments, CancellationToken ct)
     {
-        var result = await client.CallToolAsync(tool, arguments, cancellationToken: ct);
+        CallToolResult result;
+        try
+        {
+            _client ??= await Connect(url, apiKey, ct);
+            result = await _client.CallToolAsync(tool, arguments, cancellationToken: ct);
+        }
+        catch when (!ct.IsCancellationRequested)
+        {
+            await Disconnect();
+            throw;
+        }
+
         var text = string.Concat(result.Content.OfType<TextContentBlock>().Select(x => x.Text));
         if (result.IsError == true)
         {
@@ -2393,9 +2414,26 @@ sealed class BoardsClient(McpClient client) : IAsyncDisposable
         return text;
     }
 
-    public ValueTask DisposeAsync()
+    public async ValueTask DisposeAsync()
     {
-        return client.DisposeAsync();
+        await Disconnect();
+    }
+
+    private async Task Disconnect()
+    {
+        var client = _client;
+        _client = null;
+        if (client is not null)
+        {
+            try
+            {
+                await client.DisposeAsync();
+            }
+            catch (Exception e)
+            {
+                Log.Error($"Closing the Boards connection failed: {e.Message}");
+            }
+        }
     }
 }
 
