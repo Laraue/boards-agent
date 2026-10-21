@@ -64,7 +64,7 @@ Run `boards-agent setup`, ideally from inside the repository you want the agent 
 
 1. Picks the coding agent: the one you have installed, or asks when you have both.
 2. Opens Boards in your browser. Check the code, pick the organization and click **Allow**. Boards creates an API key named after the agent and your machine, e.g. "Claude Code agent (MacBook)", and hands it to the runner, which keeps it in the Keychain. You can revoke the key any time under Account -> API keys.
-3. Asks which folder your repositories are cloned under (e.g. `~/Repos`; searched three levels deep) and shows, per space, which of its repositories it found there by git remote, and which aren't cloned. New branches start from each remote's default branch (e.g. `origin/main`). If no space links to a repository yet, add the repository's URL as a link on the space in Boards, or map one by hand.
+3. Asks which folder your repositories are cloned under (e.g. `~/Repos`; searched three levels deep) - type it, or choose it in Finder or Explorer - and shows, per space, which of its repositories it found there by git remote, and which aren't cloned. New branches start from each remote's default branch (e.g. `origin/main`). If no space links to a repository yet, add the repository's URL as a link on the space in Boards, or map one by hand.
 4. Asks where the agent should work: a worktree per issue, or your own clones (see [Where the agent works](#where-the-agent-works)).
 5. Signs the agent in if it isn't (`claude auth login` or `codex login`).
 6. Offers to run the agent in the background (macOS and Windows), so there's no terminal to keep open. After that, clicking **Hand to agent** in Boards is all there is to it.

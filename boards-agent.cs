@@ -2925,7 +2925,7 @@ static class Setup
         }
 
         // 3. Where the code is: a space's repositories are the clones its links point to, found by git remote.
-        config = config with { CodeFolders = [AskCodeFolder(config)] };
+        config = config with { CodeFolders = [AskCodeFolder(config, canPick: !options.NoBrowser && FolderPicker.IsSupported)] };
         var anyRepository = false;
         await using (var boards = await BoardsClient.ConnectAsync(config.McpUrl, apiKey!, ct))
         {
@@ -3110,29 +3110,60 @@ static class Setup
     }
 
     /// <summary>
-    /// The folder the code is cloned under, as the person types it - nothing is guessed. Enter keeps the folder
-    /// configured before.
+    /// The folder the code is cloned under, typed or - on a desktop - picked in Finder/Explorer. Nothing is guessed:
+    /// Enter keeps the folder configured before, or opens the picker when there's none.
     /// </summary>
-    private static string AskCodeFolder(RunnerConfig config)
+    private static string AskCodeFolder(RunnerConfig config, bool canPick)
     {
         var current = config.CodeFolders.FirstOrDefault();
+        var picker = OperatingSystem.IsWindows() ? "Explorer" : "Finder";
+        var question = (current, canPick) switch
+        {
+            (null, true) => $"Which folder are your repositories cloned under? Press Enter to choose it in {picker}, or type a path:",
+            (null, false) => "Which folder are your repositories cloned under (e.g. ~/Repos)? Type a path:",
+            (_, true) => $"Which folder are your repositories cloned under? Enter for {current}, f to choose in {picker}, or type a path:",
+            _ => $"Which folder are your repositories cloned under? Enter for {current}, or type a path:",
+        };
+        Console.WriteLine("(They're searched three levels deep.)");
+
         while (true)
         {
-            var answer = Ask(current is null
-                ? "Which folder are your repositories cloned under (e.g. ~/Repos)? They're searched three levels deep:"
-                : $"Which folder are your repositories cloned under? Enter for {current}:");
-            if (answer.Length == 0 && current is null)
+            var answer = Ask(question);
+            string? folder;
+            if (answer.Length == 0 && current is not null)
+            {
+                folder = current;
+            }
+            else if (canPick && (answer.Length == 0 || answer is "f" or "F"))
+            {
+                folder = FolderPicker.Pick("Choose the folder your repositories are cloned under");
+                if (folder is null)
+                {
+                    if (Console.IsInputRedirected && Console.In.Peek() < 0)
+                    {
+                        throw new InvalidOperationException("No folder for the repositories was given.");
+                    }
+
+                    continue;
+                }
+
+                Console.WriteLine(folder);
+            }
+            else if (answer.Length == 0)
             {
                 if (Console.IsInputRedirected && Console.In.Peek() < 0)
                 {
                     throw new InvalidOperationException("No folder for the repositories was given.");
                 }
 
-                Console.WriteLine("Enter a folder.");
                 continue;
             }
+            else
+            {
+                folder = answer;
+            }
 
-            var folder = Paths.Expand(answer.Length == 0 ? current! : answer);
+            folder = Paths.Expand(folder);
             if (Directory.Exists(folder))
             {
                 return folder;
@@ -3249,6 +3280,44 @@ static class Setup
         Console.Write($"{question} ");
         // End of input (e.g. nothing piped in) counts as Enter.
         return Console.ReadLine()?.Trim() ?? "";
+    }
+}
+
+/// <summary>The system's own folder picker: Finder on macOS, Explorer on Windows.</summary>
+static class FolderPicker
+{
+    public static bool IsSupported => OperatingSystem.IsMacOS() || OperatingSystem.IsWindows();
+
+    /// <summary>The chosen folder, or null when the picker was cancelled or couldn't open.</summary>
+    public static string? Pick(string prompt)
+    {
+        var info = OperatingSystem.IsMacOS()
+            ? new System.Diagnostics.ProcessStartInfo("osascript")
+            : new System.Diagnostics.ProcessStartInfo("powershell");
+        string[] arguments = OperatingSystem.IsMacOS()
+            ? [
+                "-e", "on run argv",
+                "-e", "return POSIX path of (choose folder with prompt (item 1 of argv))",
+                "-e", "end run",
+                prompt,
+            ]
+            : [
+                "-NoProfile", "-STA", "-Command",
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                    + "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
+                    + "$d.Description = $env:BOARDS_AGENT_PICKER_PROMPT; "
+                    + "if ($d.ShowDialog() -eq 'OK') { $d.SelectedPath }",
+            ];
+        foreach (var argument in arguments)
+        {
+            info.ArgumentList.Add(argument);
+        }
+
+        // The prompt goes in through the environment, not the command, so nothing in it needs escaping.
+        info.Environment["BOARDS_AGENT_PICKER_PROMPT"] = prompt;
+        var result = Shell.Run(info);
+        var folder = result.Output.Trim();
+        return result.ExitCode == 0 && folder.Length > 0 ? folder.TrimEnd('/') : null;
     }
 }
 
