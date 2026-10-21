@@ -1,5 +1,6 @@
 #!/bin/sh
-# Installs (or updates) boards-agent on macOS or Linux, then runs `boards-agent setup`:
+# Installs boards-agent on macOS or Linux and runs `boards-agent setup`; when it is already set up, updates it and
+# restarts the background service instead, without questions:
 #   curl -fsSL https://raw.githubusercontent.com/Laraue/boards-agent/main/install.sh | sh
 # Optional environment variables:
 #   BOARDS_AGENT_VERSION      a release tag, e.g. v0.2.0 (default: the newest release)
@@ -83,6 +84,14 @@ case ":$PATH:" in
 esac
 
 if [ "${BOARDS_AGENT_NO_SETUP:-}" = 1 ]; then
+    exit 0
+fi
+
+# Already set up: an update only restarts the background service, so it runs the new binary - no questions.
+config="${XDG_CONFIG_HOME:-$HOME/.config}/boards-agent/config.json"
+if [ -f "$config" ]; then
+    "$bin_dir/boards-agent" service restart || true
+    echo "Updated to $("$bin_dir/boards-agent" --version). Run \`boards-agent setup\` to change its settings."
     exit 0
 fi
 
