@@ -1346,7 +1346,7 @@ static class Workspaces
 
     /// <summary>
     /// After a run: puts back what the agent didn't commit to, and returns one line per repository it did, e.g.
-    /// "laraue-boards: `agent/BRD-42`, 3 commits". In worktrees, across repositories, unchanged worktrees are removed. In
+    /// "web-app: `agent/BRD-42`, 3 commits". In worktrees, across repositories, unchanged worktrees are removed. In
     /// checkouts, an unchanged clone goes back to its previous branch and the empty branch is deleted.
     /// </summary>
     public static IReadOnlyList<string> Finish(Workspace workspace)
@@ -1381,7 +1381,7 @@ static class Workspaces
 
     /// <summary>
     /// After a run across repositories: removes the worktree and branch of every repository the agent didn't commit to,
-    /// and returns one line per repository it did, e.g. "laraue-boards: `agent/BRD-42`, 3 commits".
+    /// and returns one line per repository it did, e.g. "web-app: `agent/BRD-42`, 3 commits".
     /// </summary>
     private static IReadOnlyList<string> RemoveUnchanged(Workspace workspace)
     {

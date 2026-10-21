@@ -32,9 +32,9 @@ are the `boards` MCP server's.
 When the prompt says this folder holds a worktree per repository of the space:
 
 - Read each repository's `AGENTS.md` / `CLAUDE.md` before you change anything in it.
-- Change only the repositories the issue needs; leave the others untouched (the runner removes their worktrees).
-- Run git per repository as `git -C <folder> ...` (`git -C laraue-boards commit ...`), and build or test from inside
-  it (`cd laraue-boards && pnpm test`).
+- Change only the repositories the issue needs; leave the others untouched (the runner puts them back when the run ends).
+- Run git per repository as `git -C <folder> ...` (`git -C web-app commit ...`), and build or test from inside
+  it (`cd web-app && pnpm test`).
 - Commit in each repository you changed, all on the same branch.
 - In the final summary, list every repository you changed with its branch and what changed there.
 
