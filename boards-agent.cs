@@ -333,6 +333,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
             return branches;
         }
         Log.Info($"{run.IssueKey}: {codingAgent.Name} started (pid {agent.ProcessId}), log {logPath}.");
+        Notifications.Show(config, $"{run.IssueKey} · agent started", run.IssueTitle, run.IssueUrl);
 
         var deadline = DateTime.UtcNow.AddMinutes(config.TimeoutMinutes);
         while (true)
@@ -380,6 +381,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
                 agent.Kill();
                 Log.Info($"{run.IssueKey}: run {run.Id} was cancelled - {codingAgent.Name} killed.");
                 Branches();
+                Notifications.Show(config, $"{run.IssueKey} · agent run cancelled", run.IssueTitle, run.IssueUrl);
                 return;
             }
         }
@@ -392,8 +394,25 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
         }
         else if (finalState is AgentRunStates.Done or AgentRunStates.Failed)
         {
+            var branchesText = Branches();
+            var published = finalState == AgentRunStates.Done ? Publisher.Publish(config, run, workspace) : [];
+            var publishedText = published.Count == 0 ? "" : "\n\nPublished:\n" + string.Join("\n", published.Select(x => $"- {x.Line}"));
+
             // The agent can't know what it cost; the runner adds it under the agent's own summary.
-            await boards.CreateComment(run.IssueKey, $"_boards-agent: {agent.Summary()}_" + Branches(), CancellationToken.None);
+            await boards.CreateComment(run.IssueKey, $"_boards-agent: {agent.Summary()}_" + branchesText + publishedText, CancellationToken.None);
+            if (finalState == AgentRunStates.Done)
+            {
+                var pullRequest = published.Select(x => x.PullRequestUrl).OfType<string>().FirstOrDefault();
+                Notifications.Show(
+                    config,
+                    $"{run.IssueKey} · ready for review",
+                    pullRequest is null ? run.IssueTitle : $"{run.IssueTitle} - {pullRequest}",
+                    run.IssueUrl);
+            }
+            else
+            {
+                Notifications.Show(config, $"{run.IssueKey} · agent failed", run.FailureReason ?? run.IssueTitle, run.IssueUrl);
+            }
         }
     }
 
@@ -431,6 +450,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
             comment = comment[..MaxReasonLength];
         }
 
+        Notifications.Show(config, $"{run.IssueKey} · agent failed", reason, run.IssueUrl);
         try
         {
             await boards.CreateComment(run.IssueKey, comment, CancellationToken.None);
@@ -1694,7 +1714,7 @@ static class UserPrompt
         foreach (var argument in new[]
         {
             "-e", "on run argv",
-            "-e", $"display dialog (item 1 of argv) with title \"boards-agent\" buttons {{(item 3 of argv), (item 2 of argv)}} default button 2 giving up after {DialogTimeoutSeconds}",
+            "-e", $"display dialog (item 1 of argv) with title \"{Notifications.AppName}\" buttons {{(item 3 of argv), (item 2 of argv)}} default button 2 giving up after {DialogTimeoutSeconds}",
             "-e", "return button returned of result",
             "-e", "end run",
             message, yes, no,
@@ -1722,7 +1742,264 @@ static class WindowsDialog
     /// <summary>A Yes/No message box; the scheduled task runs with the person's interactive logon, so it shows on their screen.</summary>
     public static bool Ask(string message)
     {
-        return MessageBox(IntPtr.Zero, message, "boards-agent", YesNo | IconQuestion | Topmost | SetForeground) == Yes;
+        return MessageBox(IntPtr.Zero, message, Notifications.AppName, YesNo | IconQuestion | Topmost | SetForeground) == Yes;
+    }
+}
+
+/// <summary>One repository's published work: a line for the issue comment, and the pull request, if one was opened.</summary>
+sealed record PublishedRepo(string Line, string? PullRequestUrl);
+
+/// <summary>
+/// After a Done run, publishes the agent's work as <see cref="RunnerConfig.Publish"/> says (BRD-315): pushes the issue's
+/// branch in every repository the agent committed to and, with <see cref="PublishModes.PullRequest"/>, opens a pull
+/// request with the GitHub CLI (or finds the one an earlier run opened). Done by the runner, never the agent. Failures
+/// are reported in the returned lines, not thrown: the run is done either way.
+/// </summary>
+static class Publisher
+{
+    public static IReadOnlyList<PublishedRepo> Publish(RunnerConfig config, AgentRunSummary run, Workspace workspace)
+    {
+        var mode = config.Publish.ToLowerInvariant();
+        if (mode == PublishModes.Off)
+        {
+            return [];
+        }
+
+        var gh = mode == PublishModes.PullRequest ? CodingAgents.FindOnPath("gh") : null;
+        var published = new List<PublishedRepo>();
+        foreach (var repo in workspace.Repos)
+        {
+            if (repo.BaseCommit is null || Git.CommitsSince(repo.Path, repo.BaseCommit) <= 0)
+            {
+                continue;
+            }
+
+            var push = Git.Push(repo.Path, workspace.Branch);
+            if (push.ExitCode != 0)
+            {
+                Log.Error($"{run.IssueKey}: pushing {workspace.Branch} in {repo.Name} failed: {push.Error.Trim()}");
+                published.Add(new PublishedRepo($"{repo.Name}: pushing `{workspace.Branch}` failed: {FirstLine(push.Error)}", null));
+                continue;
+            }
+
+            Log.Info($"{run.IssueKey}: pushed {workspace.Branch} in {repo.Name}.");
+            if (mode != PublishModes.PullRequest)
+            {
+                published.Add(new PublishedRepo($"{repo.Name}: pushed `{workspace.Branch}`", null));
+            }
+            else if (gh is null)
+            {
+                published.Add(new PublishedRepo($"{repo.Name}: pushed `{workspace.Branch}` - no pull request: the GitHub CLI (gh) isn't installed", null));
+            }
+            else
+            {
+                var url = OpenPullRequest(gh, run, workspace, repo, out var error);
+                published.Add(url is null
+                    ? new PublishedRepo($"{repo.Name}: pushed `{workspace.Branch}` - the pull request failed: {error}", null)
+                    : new PublishedRepo($"{repo.Name}: {url}", url));
+            }
+        }
+
+        return published;
+    }
+
+    /// <summary>The pull request of the issue's branch: a new one, or the one an earlier run opened. Null on failure.</summary>
+    private static string? OpenPullRequest(string gh, AgentRunSummary run, Workspace workspace, WorkspaceRepo repo, out string error)
+    {
+        var slash = repo.BaseRef.IndexOf('/');
+        var baseBranch = slash > 0 ? repo.BaseRef[(slash + 1)..] : repo.BaseRef;
+        var create = RunGh(
+            gh,
+            repo.Path,
+            [
+                "pr", "create",
+                "--head", workspace.Branch,
+                "--base", baseBranch,
+                "--title", $"{run.IssueKey}: {run.IssueTitle}",
+                "--body", $"{run.IssueUrl}\n\nWork of the agent run on {run.IssueKey}, opened by boards-agent. The agent's summary is in the issue's comments.",
+            ]);
+        if (create.ExitCode == 0 && LastUrl(create.Output) is { } created)
+        {
+            Log.Info($"{run.IssueKey}: opened {created}.");
+            error = "";
+            return created;
+        }
+
+        // A re-run of the issue: its branch already has a pull request.
+        var existing = RunGh(gh, repo.Path, ["pr", "view", workspace.Branch, "--json", "url", "--jq", ".url"]);
+        if (existing.ExitCode == 0 && LastUrl(existing.Output) is { } url)
+        {
+            error = "";
+            return url;
+        }
+
+        error = FirstLine(create.Error.Length > 0 ? create.Error : create.Output);
+        Log.Error($"{run.IssueKey}: gh pr create in {repo.Name} failed: {create.Error.Trim()}");
+        return null;
+    }
+
+    private static ProcessResult RunGh(string gh, string folder, string[] arguments)
+    {
+        var info = new System.Diagnostics.ProcessStartInfo(gh) { WorkingDirectory = folder };
+        // Nobody can answer a prompt in the background service.
+        info.Environment["GH_PROMPT_DISABLED"] = "1";
+        info.Environment["GIT_TERMINAL_PROMPT"] = "0";
+        foreach (var argument in arguments)
+        {
+            info.ArgumentList.Add(argument);
+        }
+
+        return Shell.Run(info);
+    }
+
+    private static string? LastUrl(string output)
+    {
+        return output
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .LastOrDefault(x => x.StartsWith("https://", StringComparison.Ordinal));
+    }
+
+    private static string FirstLine(string text)
+    {
+        return text.Trim().Split('\n')[0].Trim();
+    }
+}
+
+/// <summary>
+/// System notifications about runs, shown as <see cref="AppName"/>. macOS names a notification after the app that posts
+/// it - osascript's would read "Script Editor" - so on macOS they come from a tiny AppleScript app the runner compiles
+/// into ~/Applications the first time; clicking one opens that app again, which opens the issue. Windows: a tray
+/// balloon; Linux: notify-send. Best effort: a notification that can't be shown is only logged.
+/// </summary>
+static class Notifications
+{
+    public const string AppName = "laraue-boards-agent";
+
+    /// <summary>Bumped when the app's script changes, so an older copy is compiled again.</summary>
+    private const string AppVersion = "4";
+
+    private const string AppScript = """
+        -- laraue-boards-agent: shows the notifications boards-agent left as pending-*.txt files (title, text, issue URL -
+        -- one per line), oldest first. Opened without any - by a click on its notification - it opens the last one's issue.
+        on run
+            set folderPath to (POSIX path of (path to home folder)) & "Library/Caches/laraue-boards-agent/"
+            set lastPath to folderPath & "last.txt"
+            set pendingFiles to paragraphs of (do shell script "cd " & quoted form of folderPath & " && ls pending-*.txt 2>/dev/null | sort || true")
+            if (count of pendingFiles) is 0 or pendingFiles is {""} then
+                try
+                    set issueUrl to item 3 of (paragraphs of (do shell script "cat " & quoted form of lastPath))
+                    if issueUrl is not "" then open location issueUrl
+                end try
+                return
+            end if
+            repeat with i from 1 to count of pendingFiles
+                set filePath to folderPath & (item i of pendingFiles)
+                try
+                    set parts to paragraphs of (do shell script "cat " & quoted form of filePath)
+                    do shell script "mv -f " & quoted form of filePath & " " & quoted form of lastPath
+                    display notification (item 2 of parts) with title (item 1 of parts)
+                    delay 1
+                end try
+            end repeat
+        end run
+        """;
+
+    public static void Show(RunnerConfig config, string title, string text, string? url)
+    {
+        if (!config.Notifications)
+        {
+            return;
+        }
+
+        try
+        {
+            if (OperatingSystem.IsMacOS())
+            {
+                ShowMac(title, text, url);
+            }
+            else if (OperatingSystem.IsWindows())
+            {
+                ShowWindows(title, text);
+            }
+            else
+            {
+                Start("notify-send", ["-a", AppName, title, text]);
+            }
+        }
+        catch (Exception e)
+        {
+            Log.Error($"Couldn't show the notification \"{title}\": {e.Message}");
+        }
+    }
+
+    private static void ShowMac(string title, string text, string? url)
+    {
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var app = Path.Combine(home, "Applications", $"{AppName}.app");
+        var versionFile = Path.Combine(app, "Contents", "Resources", "boards-agent-version");
+        if (!File.Exists(versionFile) || File.ReadAllText(versionFile).Trim() != AppVersion)
+        {
+            var source = Path.Combine(Path.GetTempPath(), $"{AppName}.applescript");
+            File.WriteAllText(source, AppScript);
+            Directory.CreateDirectory(Path.GetDirectoryName(app)!);
+            var compiled = Shell.Run("/usr/bin/osacompile", "-o", app, source);
+            if (compiled.ExitCode != 0)
+            {
+                throw new InvalidOperationException($"osacompile failed: {compiled.Error.Trim()}");
+            }
+
+            File.WriteAllText(versionFile, AppVersion);
+        }
+
+        var folder = Path.Combine(home, "Library", "Caches", AppName);
+        Directory.CreateDirectory(folder);
+        // One file per notification, named in order, so two close together are both shown.
+        File.WriteAllText(
+            Path.Combine(folder, $"pending-{DateTime.UtcNow:yyyyMMddHHmmssfffffff}.txt"),
+            $"{OneLine(title)}\n{OneLine(text)}\n{OneLine(url ?? "")}");
+        // -g: in the background, so the notification doesn't take the focus; -n: a new instance even if one still runs,
+        // which wouldn't run its script again.
+        Shell.Run("/usr/bin/open", "-n", "-g", app);
+    }
+
+    private static void ShowWindows(string title, string text)
+    {
+        var info = new System.Diagnostics.ProcessStartInfo("powershell");
+        foreach (var argument in new[]
+        {
+            "-NoProfile", "-WindowStyle", "Hidden", "-Command",
+            "Add-Type -AssemblyName System.Windows.Forms; "
+                + "$n = New-Object System.Windows.Forms.NotifyIcon; "
+                + "$n.Icon = [System.Drawing.SystemIcons]::Information; "
+                + $"$n.Text = '{AppName}'; $n.Visible = $true; "
+                + "$n.ShowBalloonTip(10000, $env:BOARDS_AGENT_TITLE, $env:BOARDS_AGENT_TEXT, 'Info'); "
+                + "Start-Sleep -Seconds 10; $n.Dispose()",
+        })
+        {
+            info.ArgumentList.Add(argument);
+        }
+
+        // The texts go in through the environment, so nothing in them needs escaping.
+        info.Environment["BOARDS_AGENT_TITLE"] = title;
+        info.Environment["BOARDS_AGENT_TEXT"] = text;
+        info.UseShellExecute = false;
+        System.Diagnostics.Process.Start(info)?.Dispose();
+    }
+
+    private static void Start(string file, string[] arguments)
+    {
+        var info = new System.Diagnostics.ProcessStartInfo(file);
+        foreach (var argument in arguments)
+        {
+            info.ArgumentList.Add(argument);
+        }
+
+        System.Diagnostics.Process.Start(info)?.Dispose();
+    }
+
+    private static string OneLine(string value)
+    {
+        return value.ReplaceLineEndings(" ").Trim();
     }
 }
 
@@ -1812,6 +2089,12 @@ static class Git
         {
             Run(repo, ["branch", "-D", branch], throwOnError: false);
         }
+    }
+
+    /// <summary>Pushes <paramref name="branch"/> to origin, setting it as the upstream. Never prompts for credentials.</summary>
+    public static ProcessResult Push(string repo, string branch)
+    {
+        return Run(repo, ["push", "--set-upstream", "origin", branch], throwOnError: false);
     }
 
     /// <summary>The branch the checkout is on, or null when HEAD is detached.</summary>
@@ -2012,7 +2295,7 @@ sealed record RunnerArgs(
     private const string Usage =
         "Usage: boards-agent [setup] [--config <file>] [--log <file>] [--once] [--dry-run] [--check] [--version]\n" +
         "       boards-agent setup [--no-browser] [--web-url <url>] [--api-url <url>] [--mcp-url <url>]\n" +
-        "       boards-agent service install|uninstall|status [--config <file>]";
+        "       boards-agent service install|uninstall|restart|status [--config <file>]";
 
     public static RunnerArgs Parse(string[] args)
     {
@@ -2074,7 +2357,7 @@ sealed record RunnerArgs(
             }
         }
 
-        if (command == ServiceCommand && serviceAction is not ("install" or "uninstall" or "status"))
+        if (command == ServiceCommand && serviceAction is not ("install" or "uninstall" or "restart" or "status"))
         {
             throw new ArgumentException($"Unknown service action: {serviceAction}.\n{Usage}");
         }
@@ -2187,6 +2470,19 @@ sealed record RunnerConfig
     /// <summary>How often a working run is checked for a cancel and the timeout.</summary>
     public int CancelCheckSeconds { get; set; } = 30;
 
+    /// <summary>
+    /// System notifications when a run starts, is ready for review, fails or is cancelled, shown as
+    /// <see cref="Notifications.AppName"/> (BRD-315).
+    /// </summary>
+    public bool Notifications { get; set; } = true;
+
+    /// <summary>
+    /// What happens to the agent's work after a Done run (BRD-315): <see cref="PublishModes.Off"/> - nothing, you push
+    /// the branch yourself; <see cref="PublishModes.Push"/> - the runner pushes it; <see cref="PublishModes.PullRequest"/>
+    /// - it also opens a pull request with the GitHub CLI. The agent itself never pushes.
+    /// </summary>
+    public string Publish { get; set; } = PublishModes.Off;
+
     /// <summary>How often Ready runs are polled.</summary>
     public int PollIntervalSeconds { get; set; } = 60;
 
@@ -2211,6 +2507,12 @@ sealed record RunnerConfig
         if (config.CodeFolders.Length == 0 && config.Spaces.Count == 0)
         {
             throw new InvalidOperationException($"{path}: no code folder to find repositories in. Run `boards-agent setup`.");
+        }
+
+        if (!PublishModes.All.Contains(config.Publish, StringComparer.OrdinalIgnoreCase))
+        {
+            throw new InvalidOperationException(
+                $"{path}: unknown publish \"{config.Publish}\": use \"{PublishModes.Off}\", \"{PublishModes.Push}\" or \"{PublishModes.PullRequest}\".");
         }
 
         if (!WorkspaceModes.All.Contains(config.Workspace, StringComparer.OrdinalIgnoreCase))
@@ -2246,6 +2548,18 @@ sealed record RunnerConfig
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         File.WriteAllText(path, JsonSerializer.Serialize(this, RunnerJson.Default.RunnerConfig));
     }
+}
+
+/// <summary>What happens to the agent's work after a Done run, see <see cref="RunnerConfig.Publish"/>.</summary>
+static class PublishModes
+{
+    public const string Off = "off";
+
+    public const string Push = "push";
+
+    public const string PullRequest = "pr";
+
+    public static readonly string[] All = [Off, Push, PullRequest];
 }
 
 /// <summary>Where the agent works, see <see cref="RunnerConfig.Workspace"/>.</summary>
@@ -2547,6 +2861,7 @@ static class Service
         {
             "install" => Install(options.ConfigPath),
             "uninstall" => Uninstall(),
+            "restart" => RestartCommand(),
             _ => Status(),
         };
     }
@@ -2614,6 +2929,21 @@ static class Service
         }
 
         Console.WriteLine($"The background service is removed. The log stays at {LogPath}.");
+        return 0;
+    }
+
+    /// <summary>`boards-agent service restart` - what the install scripts run after an update, so it starts the new binary.</summary>
+    private static int RestartCommand()
+    {
+        if (!IsInstalled)
+        {
+            Console.WriteLine("The background service isn't installed, so there's nothing to restart.");
+            return 0;
+        }
+
+        Console.WriteLine("Restarting the background service...");
+        Restart();
+        Console.WriteLine($"The background service was restarted. Log: {LogPath}");
         return 0;
     }
 
@@ -3213,10 +3543,13 @@ static class Setup
         // 4. Where the agent works: separate worktrees, or your own clones.
         config = config with { Workspace = ChooseWorkspace(config) };
 
+        // 5. What happens to the agent's work: kept local, pushed, or a pull request.
+        config = config with { Publish = ChoosePublish(config) };
+
         config.Save(options.ConfigPath);
         Console.WriteLine($"Saved {options.ConfigPath}.");
 
-        // 5. The coding agent's own sign-in.
+        // 6. The coding agent's own sign-in.
         string executable;
         try
         {
@@ -3248,7 +3581,8 @@ static class Setup
         {
             if (Service.IsInstalled)
             {
-                // The running service read the old config at start.
+                // The running service read the old config at start. Restarting waits for it to stop, which takes a moment.
+                Console.WriteLine("Restarting the background service...");
                 Service.Restart();
                 Console.WriteLine("The background service was restarted with the new settings. Hand an issue to the agent in Boards.");
             }
@@ -3314,6 +3648,40 @@ static class Setup
     }
 
     /// <summary>The workspace mode (<see cref="RunnerConfig.Workspace"/>), the config's current one by default.</summary>
+    /// <summary>The publish mode (<see cref="RunnerConfig.Publish"/>), the config's current one by default.</summary>
+    private static string ChoosePublish(RunnerConfig config)
+    {
+        string[] modes = [PublishModes.Off, PublishModes.Push, PublishModes.PullRequest];
+        var current = Array.IndexOf(modes, config.Publish.ToLowerInvariant()) + 1;
+        if (current == 0)
+        {
+            current = 1;
+        }
+
+        Console.WriteLine();
+        Console.WriteLine("When the agent is done, what should happen to its branch?");
+        Console.WriteLine("  1. Nothing - it stays on this computer, you review it and push it yourself.");
+        Console.WriteLine("  2. Push it to the repository's remote.");
+        Console.WriteLine("  3. Push it and open a pull request (needs the GitHub CLI, gh, signed in).");
+        Console.WriteLine("  The agent itself never pushes: boards-agent does, after the run is done.");
+        while (true)
+        {
+            var answer = Ask($"Number, or Enter for {current}:");
+            var number = answer.Length == 0 ? current : int.TryParse(answer, out var parsed) ? parsed : 0;
+            if (number is >= 1 and <= 3)
+            {
+                if (modes[number - 1] == PublishModes.PullRequest && CodingAgents.FindOnPath("gh") is null)
+                {
+                    Console.WriteLine("The GitHub CLI (gh) isn't installed: install it (https://cli.github.com) and run `gh auth login`, or the branch is only pushed.");
+                }
+
+                return modes[number - 1];
+            }
+
+            Console.WriteLine("Enter 1, 2 or 3.");
+        }
+    }
+
     private static string ChooseWorkspace(RunnerConfig config)
     {
         string[] modes = [WorkspaceModes.Worktree, WorkspaceModes.Checkout];

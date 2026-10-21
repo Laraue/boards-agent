@@ -1,4 +1,5 @@
-# Installs (or updates) boards-agent on Windows, then runs `boards-agent setup`. In PowerShell:
+# Installs boards-agent on Windows and runs `boards-agent setup`; when it is already set up, updates it and restarts
+# the background task instead, without questions. In PowerShell:
 #   irm https://raw.githubusercontent.com/Laraue/boards-agent/main/install.ps1 | iex
 # Optional environment variables:
 #   BOARDS_AGENT_VERSION      a release tag, e.g. v0.2.0 (default: the newest release)
@@ -60,5 +61,13 @@ if (-not (($env:Path -split ';') -contains $dir)) {
 }
 
 if ($env:BOARDS_AGENT_NO_SETUP -ne '1') {
-    & $exe setup
+    # Already set up: an update only restarts the background task (stopped above for the copy) - no questions.
+    $config = Join-Path $env:APPDATA 'boards-agent\config.json'
+    if (Test-Path $config) {
+        & $exe service restart
+        Write-Host "Updated to $(& $exe --version). Run ``boards-agent setup`` to change its settings."
+    }
+    else {
+        & $exe setup
+    }
 }
