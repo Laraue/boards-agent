@@ -2713,7 +2713,7 @@ sealed record RunnerArgs(
     private const string Usage =
         "Usage: lba [--config <file>] [--log <file>] [--once] [--dry-run] [--check] [--version]   (or laraue-boards-agent)\n" +
         "       lba setup [--no-browser] [--web-url <url>] [--api-url <url>] [--mcp-url <url>]\n" +
-        "       lba continue <issue key> [\"<instruction>\"]\n" +
+        "       lba continue <issue key> [instruction]\n" +
         "       lba service install|uninstall|restart|status [--config <file>]\n" +
         "       lba status   (the same as lba service status)";
 
@@ -2743,10 +2743,16 @@ sealed record RunnerArgs(
                 case ContinueCommand when i == 0 && i + 1 < args.Length:
                     command = ContinueCommand;
                     issueKey = args[++i].ToUpperInvariant();
-                    if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
+
+                    // The instruction is every word up to the first option, quoted or not:
+                    // lba continue MIN-21 print the json for grafana
+                    var words = new List<string>();
+                    while (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
                     {
-                        instruction = args[++i];
+                        words.Add(args[++i]);
                     }
+
+                    instruction = words.Count == 0 ? null : string.Join(' ', words);
 
                     break;
                 // `lba status`: what people type to see whether the runner works - the same as `lba service status`.
