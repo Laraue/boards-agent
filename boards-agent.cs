@@ -3404,7 +3404,22 @@ static class Service
         File.WriteAllText(PlistPath, Plist(executable, configPath));
 
         Shell.Run("/bin/launchctl", "bootout", $"{Domain}/{Label}");
+
+        // bootout returns before the old process has stopped (the runner fails its run in progress first); bootstrapping
+        // the same label meanwhile fails with "5: Input/output error". Wait for it to go, and retry once more if needed.
+        var deadline = DateTime.UtcNow.AddSeconds(30);
+        while (DateTime.UtcNow < deadline && Shell.Run("/bin/launchctl", "print", $"{Domain}/{Label}").ExitCode == 0)
+        {
+            Thread.Sleep(500);
+        }
+
         var bootstrap = Shell.Run("/bin/launchctl", "bootstrap", Domain, PlistPath);
+        if (bootstrap.ExitCode != 0)
+        {
+            Thread.Sleep(2000);
+            bootstrap = Shell.Run("/bin/launchctl", "bootstrap", Domain, PlistPath);
+        }
+
         return bootstrap.ExitCode == 0 ? null : bootstrap.Error.Trim();
     }
 
