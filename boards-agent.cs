@@ -880,7 +880,8 @@ sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
     {
         // The terminal's own input and output: the person talks to Claude Code, which asks before anything not allowed.
         var info = Info(apiKey, issueKey, workspace);
-        AddArguments(info, ["--resume", sessionId, .. Common(issueKey, workspace)]);
+        // The person approves what isn't allowed - not their own default mode (e.g. Auto), which would decide for them.
+        AddArguments(info, ["--resume", sessionId, "--permission-mode", "default", .. Common(issueKey, workspace)]);
         using var process = System.Diagnostics.Process.Start(info)!;
         process.WaitForExit();
         return process.ExitCode;
@@ -924,6 +925,8 @@ sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
             "--mcp-config", mcpConfigPath,
             "--strict-mcp-config",
             "--setting-sources", "project",
+            // Not the person's browser: Claude Code would otherwise ask (interactive) or could use Claude in Chrome.
+            "--no-chrome",
             "--allowedTools", "Skill(boards-agent:work-on-issue)", .. AllowedCommands(workspace), .. CodingAgents.BoardsTools.Select(x => $"mcp__boards__{x}"),
             "--disallowedTools", .. DisallowedTools,
             // In checkout mode the other clones aren't under the first one, where Claude Code starts.
