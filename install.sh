@@ -1,6 +1,6 @@
 #!/bin/sh
-# Installs boards-agent on macOS or Linux and runs `boards-agent setup`; when it is already set up, updates it and
-# restarts the background service instead, without questions:
+# Installs laraue-boards-agent (and its short name, lba) on macOS or Linux and runs `lba setup`; when it is already set
+# up, updates it and restarts the background service instead, without questions:
 #   curl -fsSL https://raw.githubusercontent.com/Laraue/boards-agent/main/install.sh | sh
 # Optional environment variables:
 #   BOARDS_AGENT_VERSION      a release tag, e.g. v0.2.0 (default: the newest release)
@@ -12,7 +12,7 @@ set -eu
 repo="Laraue/boards-agent"
 
 fail() {
-    echo "boards-agent install: $*" >&2
+    echo "laraue-boards-agent install: $*" >&2
     exit 1
 }
 
@@ -36,14 +36,14 @@ if [ -z "$tag" ]; then
     [ -n "$tag" ] || fail "couldn't find the newest release of $repo."
 fi
 
-asset="boards-agent-$tag-$os-$arch.tar.gz"
+asset="laraue-boards-agent-$tag-$os-$arch.tar.gz"
 base="${BOARDS_AGENT_RELEASE_URL:-https://github.com/$repo/releases/download/$tag}"
 bin_dir="${BOARDS_AGENT_INSTALL_DIR:-$HOME/.local/bin}"
 
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-echo "Downloading boards-agent $tag ($os-$arch)..."
+echo "Downloading laraue-boards-agent $tag ($os-$arch)..."
 curl -fsSL -o "$tmp/$asset" "$base/$asset" || fail "couldn't download $base/$asset."
 curl -fsSL -o "$tmp/SHA256SUMS" "$base/SHA256SUMS" || fail "couldn't download $base/SHA256SUMS."
 
@@ -58,13 +58,18 @@ fi
 tar -xzf "$tmp/$asset" -C "$tmp"
 mkdir -p "$bin_dir"
 # Copy next to the target, then rename: a running background service keeps its old binary until it restarts.
-cp "$tmp/boards-agent/boards-agent" "$bin_dir/.boards-agent.new"
-chmod 755 "$bin_dir/.boards-agent.new"
+cp "$tmp/laraue-boards-agent/laraue-boards-agent" "$bin_dir/.laraue-boards-agent.new"
+chmod 755 "$bin_dir/.laraue-boards-agent.new"
 if [ "$os" = osx ]; then
-    xattr -d com.apple.quarantine "$bin_dir/.boards-agent.new" 2>/dev/null || true
+    xattr -d com.apple.quarantine "$bin_dir/.laraue-boards-agent.new" 2>/dev/null || true
 fi
-mv -f "$bin_dir/.boards-agent.new" "$bin_dir/boards-agent"
-echo "Installed $bin_dir/boards-agent."
+mv -f "$bin_dir/.laraue-boards-agent.new" "$bin_dir/laraue-boards-agent"
+# lba: the short name. boards-agent: the name before the rename, kept as a link where it was installed.
+ln -sf laraue-boards-agent "$bin_dir/lba"
+if [ -e "$bin_dir/boards-agent" ] || [ -L "$bin_dir/boards-agent" ]; then
+    ln -sf laraue-boards-agent "$bin_dir/boards-agent"
+fi
+echo "Installed $bin_dir/laraue-boards-agent (also as lba)."
 
 # Put the folder on PATH for new terminals, the way rustup and others do.
 case ":$PATH:" in
@@ -90,14 +95,14 @@ fi
 # Already set up: an update only restarts the background service, so it runs the new binary - no questions.
 config="${XDG_CONFIG_HOME:-$HOME/.config}/boards-agent/config.json"
 if [ -f "$config" ]; then
-    "$bin_dir/boards-agent" service restart || true
-    echo "Updated to $("$bin_dir/boards-agent" --version). Run \`boards-agent setup\` to change its settings."
+    "$bin_dir/laraue-boards-agent" service restart || true
+    echo "Updated to $("$bin_dir/laraue-boards-agent" --version). Run \`lba setup\` to change its settings."
     exit 0
 fi
 
 # The script itself comes through stdin (curl | sh), so setup's questions read from the terminal instead.
 if (exec </dev/tty) 2>/dev/null; then
-    "$bin_dir/boards-agent" setup </dev/tty
+    "$bin_dir/laraue-boards-agent" setup </dev/tty
 else
-    echo "Run \`$bin_dir/boards-agent setup\` to finish."
+    echo "Run \`$bin_dir/lba setup\` to finish."
 fi
