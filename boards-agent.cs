@@ -2987,7 +2987,16 @@ sealed record RunnerConfig
     ];
 
     /// <summary>Claude Code's --max-turns. Codex has no turn limit; the timeout is its only limit.</summary>
-    public int MaxTurns { get; set; } = 50;
+    public int MaxTurns { get; set; } = DefaultMaxTurns;
+
+    /// <summary>
+    /// 150: a task across two repositories (backend and web, with tests) ran out at the old default of 50 (MIN-22). The
+    /// timeout still bounds a run that goes wrong.
+    /// </summary>
+    public const int DefaultMaxTurns = 150;
+
+    /// <summary>The default before 0.4.0-beta.5, written into every config setup saved - read as "the default".</summary>
+    private const int OldDefaultMaxTurns = 50;
 
     /// <summary>Claude Code's --max-budget-usd, if the installed version supports it. Not available for Codex.</summary>
     public decimal? MaxBudgetUsd { get; set; }
@@ -3064,6 +3073,7 @@ sealed record RunnerConfig
             ?? throw new InvalidOperationException($"{path} is empty.");
         return config with
         {
+            MaxTurns = config.MaxTurns == OldDefaultMaxTurns ? DefaultMaxTurns : config.MaxTurns,
             Spaces = config.Spaces.ToDictionary(
                 x => x.Key,
                 x => x.Value with { Repo = x.Value.Repo is { Length: > 0 } repo ? Paths.Expand(repo) : null }),
