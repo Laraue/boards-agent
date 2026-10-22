@@ -2211,7 +2211,9 @@ static class Notifications
     public const string AppName = "laraue-boards-agent";
 
     /// <summary>Bumped when the app's script changes, so an older copy is compiled again.</summary>
-    private const string AppVersion = "4";
+    private const string AppVersion = "5";
+
+    private const string BundleId = "com.laraue.boards-agent.notifier";
 
     private const string AppScript = """
         -- laraue-boards-agent: shows the notifications boards-agent left as pending-*.txt files (title, text, issue URL -
@@ -2277,13 +2279,32 @@ static class Notifications
             var source = Path.Combine(Path.GetTempPath(), $"{AppName}.applescript");
             File.WriteAllText(source, AppScript);
             Directory.CreateDirectory(Path.GetDirectoryName(app)!);
+            if (Directory.Exists(app))
+            {
+                Directory.Delete(app, recursive: true);
+            }
+
             var compiled = Shell.Run("/usr/bin/osacompile", "-o", app, source);
             if (compiled.ExitCode != 0)
             {
                 throw new InvalidOperationException($"osacompile failed: {compiled.Error.Trim()}");
             }
 
+            // osacompile gives the app no bundle identifier, and macOS silently drops notifications from an app without
+            // one. Add it and the name, sign the edited app again (ad hoc) and register it, so it shows as AppName.
+            var plist = Path.Combine(app, "Contents", "Info.plist");
+            foreach (var (key, value) in new[] { ("CFBundleIdentifier", BundleId), ("CFBundleName", AppName), ("CFBundleDisplayName", AppName) })
+            {
+                Shell.Run("/usr/bin/plutil", "-replace", key, "-string", value, plist);
+            }
+
+            // Before signing: a file added afterwards would break the signature.
             File.WriteAllText(versionFile, AppVersion);
+            Shell.Run("/usr/bin/codesign", "--force", "--deep", "--sign", "-", app);
+            Shell.Run(
+                "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
+                "-f",
+                app);
         }
 
         var folder = Path.Combine(home, "Library", "Caches", AppName);
