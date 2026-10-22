@@ -196,16 +196,18 @@ catch (OperationCanceledException) when (stop.IsCancellationRequested)
 Log.Info("Stopped.");
 return 0;
 
-// Checkout mode: true once every clone of the space is clean and on its default branch, or the person said to go
-// ahead. Uncommitted changes are never touched, so "Continue" with changes still there asks again.
+// Checkout mode: true once no clone of the space has uncommitted changes - the one case where switching branches could
+// carry or clash with the person's work, so it's asked about; they're never touched, and "Continue" with changes still
+// there asks again. A clean clone on another branch (e.g. the previous issue's, under review) is just switched: its
+// commits stay on that branch.
 static bool CheckoutsReady(SpaceContext space, AgentRunSummary run)
 {
-    var asked = false;
     while (true)
     {
-        var problems = Checkouts.Problems(space);
-        var uncommitted = problems.Any(x => x.HasChanges);
-        if (problems.Count == 0 || (asked && !uncommitted))
+        var problems = Checkouts.Problems(space)
+            .Where(x => x.HasChanges)
+            .ToList();
+        if (problems.Count == 0)
         {
             return true;
         }
@@ -216,14 +218,12 @@ static bool CheckoutsReady(SpaceContext space, AgentRunSummary run)
 
             {string.Join("\n", problems.Select(x => x.Text))}
 
-            {(uncommitted ? "Commit or stash the changes first - they're never touched. " : "")}Continue?
+            Commit or stash the changes first - they're never touched. Continue?
             """;
         if (!UserPrompt.Ask(message, yes: "Continue", no: "Not now"))
         {
             return false;
         }
-
-        asked = true;
     }
 }
 
@@ -2211,7 +2211,7 @@ static class Notifications
     public const string AppName = "laraue-boards-agent";
 
     /// <summary>Bumped when the app's script changes, so an older copy is compiled again.</summary>
-    private const string AppVersion = "5";
+    private const string AppVersion = "6";
 
     private const string BundleId = "com.laraue.boards-agent.notifier";
 
@@ -2298,6 +2298,8 @@ static class Notifications
                 Shell.Run("/usr/bin/plutil", "-replace", key, "-string", value, plist);
             }
 
+            SetIcon(app);
+
             // Before signing: a file added afterwards would break the signature.
             File.WriteAllText(versionFile, AppVersion);
             Shell.Run("/usr/bin/codesign", "--force", "--deep", "--sign", "-", app);
@@ -2316,6 +2318,51 @@ static class Notifications
         // -g: in the background, so the notification doesn't take the focus; -n: a new instance even if one still runs,
         // which wouldn't run its script again.
         Shell.Run("/usr/bin/open", "-n", "-g", app);
+    }
+
+    /// <summary>
+    /// The Laraue logo (embedded assets/icon.png) as the app's icon, replacing osacompile's script icon. Best effort:
+    /// without it the app keeps the default icon.
+    /// </summary>
+    private static void SetIcon(string app)
+    {
+        using var png = typeof(Notifications).Assembly.GetManifestResourceStream("assets/icon.png");
+        if (png is null)
+        {
+            return;
+        }
+
+        var work = Path.Combine(Path.GetTempPath(), $"{AppName}-icon-{Guid.NewGuid():N}");
+        var iconset = Path.Combine(work, "icon.iconset");
+        Directory.CreateDirectory(iconset);
+        try
+        {
+            var source = Path.Combine(work, "icon.png");
+            using (var file = File.Create(source))
+            {
+                png.CopyTo(file);
+            }
+
+            foreach (var size in new[] { 16, 32, 128, 256, 512 })
+            {
+                Shell.Run("/usr/bin/sips", "-z", $"{size}", $"{size}", source, "--out", Path.Combine(iconset, $"icon_{size}x{size}.png"));
+                if (size * 2 <= 512)
+                {
+                    Shell.Run("/usr/bin/sips", "-z", $"{size * 2}", $"{size * 2}", source, "--out", Path.Combine(iconset, $"icon_{size}x{size}@2x.png"));
+                }
+            }
+
+            var icns = Path.Combine(app, "Contents", "Resources", "applet.icns");
+            var converted = Shell.Run("/usr/bin/iconutil", "-c", "icns", iconset, "-o", icns);
+            if (converted.ExitCode != 0)
+            {
+                Log.Error($"The notification app's icon couldn't be made: {converted.Error.Trim()}");
+            }
+        }
+        finally
+        {
+            Directory.Delete(work, recursive: true);
+        }
     }
 
     private static void ShowWindows(string title, string text)
