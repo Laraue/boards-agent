@@ -1646,6 +1646,16 @@ static class AgentSessions
         }
     }
 
+    /// <summary>The session saved last, or null when there's none.</summary>
+    public static AgentSession? Latest(string besidePath)
+    {
+        var folder = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(besidePath))!, "sessions");
+        var newest = Directory.Exists(folder)
+            ? new DirectoryInfo(folder).GetFiles("*.json").OrderByDescending(x => x.LastWriteTimeUtc).FirstOrDefault()
+            : null;
+        return newest is null ? null : Load(besidePath, Path.GetFileNameWithoutExtension(newest.Name));
+    }
+
     private static string PathFor(string besidePath, string issueKey)
     {
         return Path.Combine(Path.GetDirectoryName(Path.GetFullPath(besidePath))!, "sessions", $"{issueKey.ToUpperInvariant()}.json");
@@ -1662,8 +1672,14 @@ static class ContinueCommand
     public static async Task<int> RunAsync(RunnerArgs options, CancellationToken ct)
     {
         var config = RunnerConfig.Load(options.ConfigPath);
-        var key = options.IssueKey!;
         var runFile = RunsInProgress.PathFor(options.ConfigPath);
+        var key = options.IssueKey ?? PickIssue(runFile);
+        if (key is null)
+        {
+            Console.WriteLine("No agent run on this computer to continue yet. Hand an issue to the agent in Boards first.");
+            return 1;
+        }
+
         if (AgentSessions.Load(runFile, key) is not { } session)
         {
             Console.WriteLine($"There's no agent run of {key} on this computer to continue. Hand it to the agent in Boards first.");
@@ -1756,6 +1772,31 @@ static class ContinueCommand
         var pullRequest = published.Select(x => x.PullRequestUrl).OfType<string>().FirstOrDefault();
         Notifications.Show(config, $"{key} · ready for review", pullRequest is null ? session.IssueTitle : $"{session.IssueTitle} - {pullRequest}", session.IssueUrl);
         return 0;
+    }
+
+    /// <summary>
+    /// The issue when `lba continue` gets no key: the one whose agent branch the current folder is on
+    /// (agent/BRD-42-...), else the one this computer's agent worked on last. Says which it picked.
+    /// </summary>
+    private static string? PickIssue(string runFile)
+    {
+        if (Git.FindCheckout(Environment.CurrentDirectory) is { } checkout
+            && Git.CurrentBranch(checkout) is { } branch
+            && System.Text.RegularExpressions.Regex.Match(branch, "^agent/([A-Za-z][A-Za-z0-9]*-[0-9]+)") is { Success: true } match
+            && AgentSessions.Load(runFile, match.Groups[1].Value) is not null)
+        {
+            var fromBranch = match.Groups[1].Value.ToUpperInvariant();
+            Console.WriteLine($"Continuing {fromBranch}, the issue of the branch you're on ({branch}).");
+            return fromBranch;
+        }
+
+        if (AgentSessions.Latest(runFile) is { } latest)
+        {
+            Console.WriteLine($"Continuing {latest.IssueKey} \"{latest.IssueTitle}\", your agent's last run. Name another issue with `lba continue <issue key>`.");
+            return latest.IssueKey;
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -2754,7 +2795,7 @@ sealed record RunnerArgs(
     private const string Usage =
         "Usage: lba [--config <file>] [--log <file>] [--once] [--dry-run] [--check] [--version]   (or laraue-boards-agent)\n" +
         "       lba setup [--no-browser] [--web-url <url>] [--api-url <url>] [--mcp-url <url>]\n" +
-        "       lba continue <issue key> [instruction]\n" +
+        "       lba continue [issue key] [instruction]\n" +
         "       lba service install|uninstall|restart|status [--config <file>]\n" +
         "       lba status   (the same as lba service status)";
 
@@ -2781,12 +2822,16 @@ sealed record RunnerArgs(
                 case SetupCommand when i == 0:
                     command = SetupCommand;
                     break;
-                case ContinueCommand when i == 0 && i + 1 < args.Length:
+                case ContinueCommand when i == 0:
                     command = ContinueCommand;
-                    issueKey = args[++i].ToUpperInvariant();
 
-                    // The instruction is every word up to the first option, quoted or not:
-                    // lba continue MIN-21 print the json for grafana
+                    // The issue key is optional (ContinueCommand picks the issue then); the instruction is every word up
+                    // to the first option, quoted or not: lba continue MIN-21 print the json for grafana
+                    if (i + 1 < args.Length && IssueKeys.IsKey(args[i + 1]))
+                    {
+                        issueKey = args[++i].ToUpperInvariant();
+                    }
+
                     var words = new List<string>();
                     while (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
                     {
@@ -3268,6 +3313,12 @@ sealed record SpaceLinkSummary(string Url, string Description);
 
 static class IssueKeys
 {
+    /// <summary>Whether <paramref name="text"/> looks like an issue key, e.g. BRD-42 (any case).</summary>
+    public static bool IsKey(string text)
+    {
+        return System.Text.RegularExpressions.Regex.IsMatch(text, "^[A-Za-z][A-Za-z0-9]*-[0-9]+$");
+    }
+
     /// <summary>The space part of an issue key: BRD for BRD-42.</summary>
     public static string SpaceKey(string issueKey)
     {
