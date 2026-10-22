@@ -13,7 +13,18 @@ using System.Text.Json.Serialization.Metadata;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 
-var options = RunnerArgs.Parse(args);
+RunnerArgs options;
+try
+{
+    options = RunnerArgs.Parse(args);
+}
+catch (ArgumentException e)
+{
+    // A typo isn't a crash: the message and the usage, no stack trace.
+    Console.Error.WriteLine(e.Message);
+    return 2;
+}
+
 if (options.LogPath is not null)
 {
     Log.ToFile(options.LogPath);
@@ -725,6 +736,9 @@ abstract class AgentProcess : IDisposable
     /// <summary>How the agent ended, for the log and the issue comment: outcome, turns, cost.</summary>
     public abstract string Summary();
 
+    /// <summary>The agent's last message to the person - its answer; null when it said nothing.</summary>
+    public abstract string? FinalMessage();
+
     /// <summary>One line of the agent's stdout, already written to the log.</summary>
     protected abstract void OnOutputLine(string line);
 
@@ -996,6 +1010,24 @@ sealed class ClaudeCodeProcess(System.Diagnostics.Process process, string logPat
         }
     }
 
+    public override string? FinalMessage()
+    {
+        if (_resultLine is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            using var result = JsonDocument.Parse(_resultLine);
+            return result.RootElement.TryGetProperty("result", out var text) ? text.GetString() : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
     protected override void OnOutputLine(string line)
     {
         if (IsResult(line))
@@ -1167,9 +1199,15 @@ sealed class CodexAgent(RunnerConfig config) : ICodingAgent
 sealed class CodexProcess(System.Diagnostics.Process process, string logPath) : AgentProcess(process, logPath)
 {
     private int _turns;
+    private string? _lastMessage;
     private long _inputTokens;
     private long _outputTokens;
     private string? _error;
+
+    public override string? FinalMessage()
+    {
+        return _lastMessage;
+    }
 
     public override string Summary()
     {
@@ -1187,6 +1225,12 @@ sealed class CodexProcess(System.Diagnostics.Process process, string logPath) : 
             var root = message.RootElement;
             switch (root.TryGetProperty("type", out var type) ? type.GetString() : null)
             {
+                case "item.completed"
+                    when root.TryGetProperty("item", out var item)
+                        && item.TryGetProperty("type", out var itemType)
+                        && itemType.GetString() == "agent_message":
+                    _lastMessage = item.TryGetProperty("text", out var messageText) ? messageText.GetString() : _lastMessage;
+                    break;
                 case "thread.started":
                     SessionId = root.TryGetProperty("thread_id", out var thread) ? thread.GetString() : null;
                     break;
@@ -1602,6 +1646,16 @@ static class AgentSessions
         }
     }
 
+    /// <summary>The session saved last, or null when there's none.</summary>
+    public static AgentSession? Latest(string besidePath)
+    {
+        var folder = Path.Combine(Path.GetDirectoryName(Path.GetFullPath(besidePath))!, "sessions");
+        var newest = Directory.Exists(folder)
+            ? new DirectoryInfo(folder).GetFiles("*.json").OrderByDescending(x => x.LastWriteTimeUtc).FirstOrDefault()
+            : null;
+        return newest is null ? null : Load(besidePath, Path.GetFileNameWithoutExtension(newest.Name));
+    }
+
     private static string PathFor(string besidePath, string issueKey)
     {
         return Path.Combine(Path.GetDirectoryName(Path.GetFullPath(besidePath))!, "sessions", $"{issueKey.ToUpperInvariant()}.json");
@@ -1618,8 +1672,14 @@ static class ContinueCommand
     public static async Task<int> RunAsync(RunnerArgs options, CancellationToken ct)
     {
         var config = RunnerConfig.Load(options.ConfigPath);
-        var key = options.IssueKey!;
         var runFile = RunsInProgress.PathFor(options.ConfigPath);
+        var key = options.IssueKey ?? PickIssue(runFile);
+        if (key is null)
+        {
+            Console.WriteLine("No agent run on this computer to continue yet. Hand an issue to the agent in Boards first.");
+            return 1;
+        }
+
         if (AgentSessions.Load(runFile, key) is not { } session)
         {
             Console.WriteLine($"There's no agent run of {key} on this computer to continue. Hand it to the agent in Boards first.");
@@ -1656,6 +1716,14 @@ static class ContinueCommand
             {
                 agent.Kill();
                 Console.WriteLine("Stopped.");
+            }
+
+            // Its answer belongs on the screen, not only in the log - e.g. something it was asked to print.
+            if (agent.FinalMessage() is { Length: > 0 } answer)
+            {
+                Console.WriteLine();
+                Console.WriteLine(answer);
+                Console.WriteLine();
             }
 
             Console.WriteLine(agent.Summary());
@@ -1704,6 +1772,31 @@ static class ContinueCommand
         var pullRequest = published.Select(x => x.PullRequestUrl).OfType<string>().FirstOrDefault();
         Notifications.Show(config, $"{key} · ready for review", pullRequest is null ? session.IssueTitle : $"{session.IssueTitle} - {pullRequest}", session.IssueUrl);
         return 0;
+    }
+
+    /// <summary>
+    /// The issue when `lba continue` gets no key: the one whose agent branch the current folder is on
+    /// (agent/BRD-42-...), else the one this computer's agent worked on last. Says which it picked.
+    /// </summary>
+    private static string? PickIssue(string runFile)
+    {
+        if (Git.FindCheckout(Environment.CurrentDirectory) is { } checkout
+            && Git.CurrentBranch(checkout) is { } branch
+            && System.Text.RegularExpressions.Regex.Match(branch, "^agent/([A-Za-z][A-Za-z0-9]*-[0-9]+)") is { Success: true } match
+            && AgentSessions.Load(runFile, match.Groups[1].Value) is not null)
+        {
+            var fromBranch = match.Groups[1].Value.ToUpperInvariant();
+            Console.WriteLine($"Continuing {fromBranch}, the issue of the branch you're on ({branch}).");
+            return fromBranch;
+        }
+
+        if (AgentSessions.Latest(runFile) is { } latest)
+        {
+            Console.WriteLine($"Continuing {latest.IssueKey} \"{latest.IssueTitle}\", your agent's last run. Name another issue with `lba continue <issue key>`.");
+            return latest.IssueKey;
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -2702,8 +2795,9 @@ sealed record RunnerArgs(
     private const string Usage =
         "Usage: lba [--config <file>] [--log <file>] [--once] [--dry-run] [--check] [--version]   (or laraue-boards-agent)\n" +
         "       lba setup [--no-browser] [--web-url <url>] [--api-url <url>] [--mcp-url <url>]\n" +
-        "       lba continue <issue key> [\"<instruction>\"]\n" +
-        "       lba service install|uninstall|restart|status [--config <file>]";
+        "       lba continue [issue key] [instruction]\n" +
+        "       lba service install|uninstall|restart|status [--config <file>]\n" +
+        "       lba status   (the same as lba service status)";
 
     public static RunnerArgs Parse(string[] args)
     {
@@ -2728,14 +2822,29 @@ sealed record RunnerArgs(
                 case SetupCommand when i == 0:
                     command = SetupCommand;
                     break;
-                case ContinueCommand when i == 0 && i + 1 < args.Length:
+                case ContinueCommand when i == 0:
                     command = ContinueCommand;
-                    issueKey = args[++i].ToUpperInvariant();
-                    if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
+
+                    // The issue key is optional (ContinueCommand picks the issue then); the instruction is every word up
+                    // to the first option, quoted or not: lba continue MIN-21 print the json for grafana
+                    if (i + 1 < args.Length && IssueKeys.IsKey(args[i + 1]))
                     {
-                        instruction = args[++i];
+                        issueKey = args[++i].ToUpperInvariant();
                     }
 
+                    var words = new List<string>();
+                    while (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
+                    {
+                        words.Add(args[++i]);
+                    }
+
+                    instruction = words.Count == 0 ? null : string.Join(' ', words);
+
+                    break;
+                // `lba status`: what people type to see whether the runner works - the same as `lba service status`.
+                case "status" when i == 0:
+                    command = ServiceCommand;
+                    serviceAction = "status";
                     break;
                 case ServiceCommand when i == 0 && i + 1 < args.Length:
                     command = ServiceCommand;
@@ -3204,6 +3313,12 @@ sealed record SpaceLinkSummary(string Url, string Description);
 
 static class IssueKeys
 {
+    /// <summary>Whether <paramref name="text"/> looks like an issue key, e.g. BRD-42 (any case).</summary>
+    public static bool IsKey(string text)
+    {
+        return System.Text.RegularExpressions.Regex.IsMatch(text, "^[A-Za-z][A-Za-z0-9]*-[0-9]+$");
+    }
+
     /// <summary>The space part of an issue key: BRD for BRD-42.</summary>
     public static string SpaceKey(string issueKey)
     {
