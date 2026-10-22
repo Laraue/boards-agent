@@ -23,15 +23,15 @@ Setup asks; the `workspace` setting in the config holds the answer.
 - **`worktree`** (the default): a separate git worktree per issue under `worktreeFolder` (`~/boards-agent-worktrees`). Your clones aren't touched, so you can keep working in them while the agent works. Branches without commits are removed when the run ends.
 - **`checkout`**: your own clones, one issue at a time. For each of the space's repositories, boards-agent fetches the default branch and switches the clone to the issue's new branch from it (your local `main` isn't touched). When the run ends, the clones the agent committed to stay on that branch: open them in your IDE, run the app and review as you always do. The others go back to the branch they were on, and their empty branch is deleted.
 
-  Before switching, boards-agent checks every clone. If one has uncommitted changes or isn't on its default branch (for example, it's still on the previous issue's branch while you review it), it asks you first: in the terminal, or with a dialog when it runs in the background.
-  - **Continue**: checks again. A clone that still has uncommitted changes makes it ask again: your changes are never stashed or discarded, so commit or stash them yourself. A clean clone on another branch is switched, and that branch's commits stay where they are.
+  Before switching, boards-agent checks every clone. A clean clone is switched without asking, whatever branch it's on (for example, the previous issue's, while you review it): its commits stay on that branch. Only a clone with uncommitted changes makes it ask you first - in the terminal, or with a dialog when it runs in the background - since switching could carry them along or clash with them.
+  - **Continue**: checks again. A clone that still has uncommitted changes makes it ask again: your changes are never stashed or discarded, so commit or stash them yourself.
   - **Not now**: the run stays Ready, and you're asked again in 10 minutes. A dialog nobody answers counts as Not now after 10 minutes.
 
   Claude Code starts in the first repository and gets the others with `--add-dir`; Codex gets them as writable folders of its sandbox. Don't edit those clones while the agent works in them.
 
 ## When the agent is done
 
-- **Notifications.** boards-agent shows a system notification, as **laraue-boards-agent**, when a run starts, is ready for review, fails or is cancelled. Clicking it opens the issue. On macOS they come from a tiny app boards-agent creates in `~/Applications/laraue-boards-agent.app`, since macOS names a notification after the app that sends it; the first one may ask whether it may notify you. `"notifications": false` in the config turns them off.
+- **Notifications.** boards-agent shows a system notification, as **laraue-boards-agent** with the Laraue logo, when a run starts, is ready for review, fails or is cancelled. Clicking it opens the issue. On macOS they come from a tiny app boards-agent creates in `~/Applications/laraue-boards-agent.app`, since macOS names a notification after the app that sends it; the first one may ask whether it may notify you. `"notifications": false` in the config turns them off.
 - **Publishing** (`publish`, asked in setup, `off` by default):
   - `off`: the branch stays on your computer.
   - `push`: after a run ends Done, boards-agent pushes the issue's branch in every repository the agent committed to.

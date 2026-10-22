@@ -2,5 +2,7 @@
   <!-- The agent skill ships inside the runner: boards-agent.cs writes it out and passes it to Claude Code as a plugin directory. -->
   <ItemGroup>
     <EmbeddedResource Include="plugin/**/*" LogicalName="plugin/%(RecursiveDir)%(Filename)%(Extension)" />
+    <!-- The icon of the macOS notification app (laraue-boards-agent.app): the Laraue logo. -->
+    <EmbeddedResource Include="assets/icon.png" LogicalName="assets/icon.png" />
   </ItemGroup>
 </Project>
