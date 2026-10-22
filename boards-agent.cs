@@ -13,7 +13,18 @@ using System.Text.Json.Serialization.Metadata;
 using ModelContextProtocol.Client;
 using ModelContextProtocol.Protocol;
 
-var options = RunnerArgs.Parse(args);
+RunnerArgs options;
+try
+{
+    options = RunnerArgs.Parse(args);
+}
+catch (ArgumentException e)
+{
+    // A typo isn't a crash: the message and the usage, no stack trace.
+    Console.Error.WriteLine(e.Message);
+    return 2;
+}
+
 if (options.LogPath is not null)
 {
     Log.ToFile(options.LogPath);
@@ -2703,7 +2714,8 @@ sealed record RunnerArgs(
         "Usage: lba [--config <file>] [--log <file>] [--once] [--dry-run] [--check] [--version]   (or laraue-boards-agent)\n" +
         "       lba setup [--no-browser] [--web-url <url>] [--api-url <url>] [--mcp-url <url>]\n" +
         "       lba continue <issue key> [\"<instruction>\"]\n" +
-        "       lba service install|uninstall|restart|status [--config <file>]";
+        "       lba service install|uninstall|restart|status [--config <file>]\n" +
+        "       lba status   (the same as lba service status)";
 
     public static RunnerArgs Parse(string[] args)
     {
@@ -2736,6 +2748,11 @@ sealed record RunnerArgs(
                         instruction = args[++i];
                     }
 
+                    break;
+                // `lba status`: what people type to see whether the runner works - the same as `lba service status`.
+                case "status" when i == 0:
+                    command = ServiceCommand;
+                    serviceAction = "status";
                     break;
                 case ServiceCommand when i == 0 && i + 1 < args.Length:
                     command = ServiceCommand;

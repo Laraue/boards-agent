@@ -93,7 +93,7 @@ The macOS binaries aren't notarized yet. If macOS refuses to open the binary, al
 - Windows: a Task Scheduler task that runs at logon, without a window. Log: `%LOCALAPPDATA%\boards-agent\boards-agent.log`.
 - Linux (systemd) isn't supported yet: run `lba` in a terminal there.
 
-`lba service status` shows whether it runs and the end of its log; `lba service restart` restarts it (the install script does after an update); `lba service uninstall` removes it. Stopping the service on macOS fails a run in progress, so the issue isn't left locked. On Windows a stopped task can't report that: cancel the run in Boards.
+`lba service status` (or just `lba status`) shows whether it runs and the end of its log; `lba service restart` restarts it (the install script does after an update); `lba service uninstall` removes it. Stopping the service on macOS fails a run in progress, so the issue isn't left locked. On Windows a stopped task can't report that: cancel the run in Boards.
 
 ## Commands
 
