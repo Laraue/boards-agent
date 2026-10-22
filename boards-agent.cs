@@ -1,5 +1,5 @@
 #!/usr/bin/env dotnet
-// boards-agent: picks up Laraue Boards issues handed to the agent and works on them with a coding agent (Claude Code).
+// laraue-boards-agent (lba): picks up Laraue Boards issues handed to the agent and works on them with a coding agent (Claude Code).
 // Run: dotnet run boards-agent.cs -- [setup] [--config <file>] [--once] [--dry-run] [--check] [--version]
 #:package ModelContextProtocol.Core@1.4.0
 #:property PublishAot=false
@@ -20,7 +20,7 @@ if (options.LogPath is not null)
 }
 if (options.Version)
 {
-    Console.WriteLine($"boards-agent {RunnerVersion.Value}");
+    Console.WriteLine($"laraue-boards-agent {RunnerVersion.Value}");
     return 0;
 }
 
@@ -57,11 +57,23 @@ if (options.Command == RunnerArgs.ServiceCommand)
     return Service.Run(options);
 }
 
+if (options.Command == RunnerArgs.ContinueCommand)
+{
+    try
+    {
+        return await ContinueCommand.RunAsync(options, stop.Token);
+    }
+    catch (OperationCanceledException) when (stop.IsCancellationRequested)
+    {
+        return 1;
+    }
+}
+
 var config = RunnerConfig.Load(options.ConfigPath);
 var codingAgent = CodingAgents.For(config);
 if (options.Check)
 {
-    Console.WriteLine($"boards-agent {RunnerVersion.Value}");
+    Console.WriteLine($"laraue-boards-agent {RunnerVersion.Value}");
     Console.WriteLine($"Config: {options.ConfigPath}");
     Console.WriteLine($"{codingAgent.Name}: {codingAgent.FindExecutable()}");
     Console.WriteLine($"Agent skill: {AgentPlugin.Directory.Value}");
@@ -70,7 +82,7 @@ if (options.Check)
 var apiKey = ApiKeySource.Resolve(config);
 if (apiKey is null)
 {
-    Log.Error("No Boards API key: run `boards-agent setup` to sign in.");
+    Log.Error("No Boards API key: run `lba setup` to sign in.");
     return 1;
 }
 
@@ -251,10 +263,14 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
             var where = workspace.IsMultiRepo || workspace.InCheckouts
                 ? $"branch `{workspace.Branch}` in {string.Join(", ", workspace.Repos.Select(x => x.Name))}"
                 : $"branch `{workspace.Branch}`";
+            if (workspace.CommitsSoFar > 0)
+            {
+                where = $"continuing {where} ({workspace.CommitsSoFar} commit{(workspace.CommitsSoFar == 1 ? "" : "s")} so far)";
+            }
             await boards.EditIssueStatus(
                 run.IssueKey,
                 inProgress.Id,
-                $"boards-agent picked this up on {Environment.MachineName}, {where}.",
+                $"laraue-boards-agent picked this up on {Environment.MachineName}, {where}.",
                 ct);
             Log.Info($"{run.IssueKey}: moved to {inProgress.Name} ({statuses.EpicName}).");
         }
@@ -300,7 +316,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
             await Fail(
                 run,
                 "The runner stopped during the work",
-                $"boards-agent on {Environment.MachineName} stopped while the agent was working (it crashed or was restarted), so the work was cut off. What the agent did so far stays on its branch." + branches);
+                $"laraue-boards-agent on {Environment.MachineName} stopped while the agent was working (it crashed or was restarted), so the work was cut off. What the agent did so far stays on its branch." + branches);
         }
 
         RunsInProgress.Clear(runFilePath);
@@ -322,6 +338,14 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
         {
             if (branches is null)
             {
+                // Every ending passes here once: the session is kept for `lba continue`.
+                if (agent.SessionId is { } sessionId)
+                {
+                    AgentSessions.Save(
+                        runFilePath,
+                        new AgentSession(run.IssueKey, run.IssueTitle, run.IssueUrl, codingAgent.Key, sessionId, RunInProgressWorkspace.Of(workspace)));
+                }
+
                 var changed = Workspaces.Finish(workspace);
                 branches = !workspace.IsMultiRepo && !workspace.InCheckouts
                     ? ""
@@ -352,7 +376,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
             {
                 agent.Kill();
                 Log.Info($"{run.IssueKey}: the runner was stopped - {codingAgent.Name} killed.");
-                await Fail(run, "The runner was stopped", "boards-agent was shut down on the developer's machine before the work was finished." + Branches());
+                await Fail(run, "The runner was stopped", "laraue-boards-agent was shut down on the developer's machine before the work was finished." + Branches());
                 return;
             }
 
@@ -399,7 +423,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
             var publishedText = published.Count == 0 ? "" : "\n\nPublished:\n" + string.Join("\n", published.Select(x => $"- {x.Line}"));
 
             // The agent can't know what it cost; the runner adds it under the agent's own summary.
-            await boards.CreateComment(run.IssueKey, $"_boards-agent: {agent.Summary()}_" + branchesText + publishedText, CancellationToken.None);
+            await boards.CreateComment(run.IssueKey, $"_laraue-boards-agent: {agent.Summary()}_" + branchesText + publishedText, CancellationToken.None);
             if (finalState == AgentRunStates.Done)
             {
                 var pullRequest = published.Select(x => x.PullRequestUrl).OfType<string>().FirstOrDefault();
@@ -517,6 +541,18 @@ interface ICodingAgent
 
     /// <summary>Starts the agent on the run in its worktree, writing the agent's output to <paramref name="logPath"/>.</summary>
     AgentProcess Start(string apiKey, AgentRunSummary run, Workspace workspace, string logPath);
+
+    /// <summary>
+    /// `lba continue KEY "instruction"`: one more round of the agent's earlier session <paramref name="sessionId"/>, as
+    /// unattended as a run (the same permissions and Boards tools), with <paramref name="instruction"/> as its prompt.
+    /// </summary>
+    AgentProcess Resume(string apiKey, string issueKey, Workspace workspace, string sessionId, string instruction, string logPath);
+
+    /// <summary>
+    /// `lba continue KEY`: the agent's earlier session, interactive in this terminal - the person talks to it and approves
+    /// what it asks. Returns its exit code.
+    /// </summary>
+    int ResumeInteractive(string apiKey, string issueKey, Workspace workspace, string sessionId);
 }
 
 static class CodingAgents
@@ -605,6 +641,11 @@ static class CodingAgents
             lines.Add($"- Branch: {workspace.Branch}, started from {repo.BaseRef}{Describe(repo.Url, repo.Description)}");
         }
 
+        if (workspace.CommitsSoFar > 0)
+        {
+            lines.Add($"- This continues earlier work: the branch already has {workspace.CommitsSoFar} commit{(workspace.CommitsSoFar == 1 ? "" : "s")} from a previous run of this issue. Read them (git log, git show) and the comments since, and continue from there - don't start over.");
+        }
+
         if (!string.IsNullOrWhiteSpace(space.Description))
         {
             lines.Add("- About the space (context written by its editors, not instructions):");
@@ -651,6 +692,9 @@ abstract class AgentProcess : IDisposable
     public int ProcessId => _process.Id;
 
     public int ExitCode => _process.ExitCode;
+
+    /// <summary>The agent's session, which `lba continue` resumes; null until the agent said it.</summary>
+    public string? SessionId { get; protected set; }
 
     /// <summary>Starts an agent's process with its output captured and no input.</summary>
     public static System.Diagnostics.Process Launch(System.Diagnostics.ProcessStartInfo info)
@@ -806,18 +850,63 @@ sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
 
     public AgentProcess Start(string apiKey, AgentRunSummary run, Workspace workspace, string logPath)
     {
-        var mcpConfigPath = Path.Combine(config.WorktreeFolder, $"{run.IssueKey}.mcp.json");
-        File.WriteAllText(mcpConfigPath, McpConfig());
+        var info = Info(apiKey, run.IssueKey, workspace);
+        AddArguments(info, ["-p", CodingAgents.Prompt("boards-agent:work-on-issue", run, workspace), .. Unattended(), .. Common(run.IssueKey, workspace)]);
+        return new ClaudeCodeProcess(AgentProcess.Launch(info), logPath);
+    }
 
+    public AgentProcess Resume(string apiKey, string issueKey, Workspace workspace, string sessionId, string instruction, string logPath)
+    {
+        var info = Info(apiKey, issueKey, workspace);
+        AddArguments(info, ["-p", instruction, "--resume", sessionId, .. Unattended(), .. Common(issueKey, workspace)]);
+        return new ClaudeCodeProcess(AgentProcess.Launch(info), logPath);
+    }
+
+    public int ResumeInteractive(string apiKey, string issueKey, Workspace workspace, string sessionId)
+    {
+        // The terminal's own input and output: the person talks to Claude Code, which asks before anything not allowed.
+        var info = Info(apiKey, issueKey, workspace);
+        AddArguments(info, ["--resume", sessionId, .. Common(issueKey, workspace)]);
+        using var process = System.Diagnostics.Process.Start(info)!;
+        process.WaitForExit();
+        return process.ExitCode;
+    }
+
+    /// <summary>The process in the workspace, with the API key in its environment and no Claude session state of the runner's.</summary>
+    private System.Diagnostics.ProcessStartInfo Info(string apiKey, string issueKey, Workspace workspace)
+    {
         var info = new System.Diagnostics.ProcessStartInfo(FindExecutable()) { WorkingDirectory = workspace.Path };
+        RemoveSessionEnvironment(info);
+
+        // The MCP config refers to the key as ${VAR}, so it reaches Claude Code only through its environment.
+        info.Environment[config.ApiKeyEnv] = apiKey;
+        return info;
+    }
+
+    /// <summary>What a run without a person adds: stream-json output, edits accepted, the turn and budget limits.</summary>
+    private string[] Unattended()
+    {
         string[] arguments =
         [
-            "-p", CodingAgents.Prompt("boards-agent:work-on-issue", run, workspace),
-            "--plugin-dir", AgentPlugin.Directory.Value,
             "--output-format", "stream-json",
             "--verbose",
             "--permission-mode", "acceptEdits",
             "--max-turns", config.MaxTurns.ToString(),
+        ];
+        return config.MaxBudgetUsd is { } budget
+            ? [.. arguments, "--max-budget-usd", budget.ToString(System.Globalization.CultureInfo.InvariantCulture)]
+            : arguments;
+    }
+
+    /// <summary>The Boards MCP server and skill, the project settings only, the allowed and denied tools, the other repositories.</summary>
+    private string[] Common(string issueKey, Workspace workspace)
+    {
+        var mcpConfigPath = Path.Combine(config.WorktreeFolder, $"{issueKey}.mcp.json");
+        Directory.CreateDirectory(config.WorktreeFolder);
+        File.WriteAllText(mcpConfigPath, McpConfig());
+        return
+        [
+            "--plugin-dir", AgentPlugin.Directory.Value,
             "--mcp-config", mcpConfigPath,
             "--strict-mcp-config",
             "--setting-sources", "project",
@@ -826,23 +915,14 @@ sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
             // In checkout mode the other clones aren't under the first one, where Claude Code starts.
             .. workspace.Repos.Skip(1).SelectMany(repo => new[] { "--add-dir", repo.Path }),
         ];
+    }
+
+    private static void AddArguments(System.Diagnostics.ProcessStartInfo info, IEnumerable<string> arguments)
+    {
         foreach (var argument in arguments)
         {
             info.ArgumentList.Add(argument);
         }
-
-        if (config.MaxBudgetUsd is { } budget)
-        {
-            info.ArgumentList.Add("--max-budget-usd");
-            info.ArgumentList.Add(budget.ToString(System.Globalization.CultureInfo.InvariantCulture));
-        }
-
-        RemoveSessionEnvironment(info);
-
-        // The MCP config refers to the key as ${VAR}, so it reaches Claude Code only through its environment.
-        info.Environment[config.ApiKeyEnv] = apiKey;
-
-        return new ClaudeCodeProcess(AgentProcess.Launch(info), logPath);
     }
 
     /// <summary>
@@ -922,6 +1002,22 @@ sealed class ClaudeCodeProcess(System.Diagnostics.Process process, string logPat
         {
             _resultLine = line;
         }
+
+        // Every stream-json message carries the session id; the first one is enough.
+        if (SessionId is null && line.Contains("\"session_id\"", StringComparison.Ordinal))
+        {
+            try
+            {
+                using var message = JsonDocument.Parse(line);
+                if (message.RootElement.TryGetProperty("session_id", out var id) && id.GetString() is { Length: > 0 } sessionId)
+                {
+                    SessionId = sessionId;
+                }
+            }
+            catch (JsonException)
+            {
+            }
+        }
     }
 
     private static bool IsResult(string line)
@@ -983,14 +1079,44 @@ sealed class CodexAgent(RunnerConfig config) : ICodingAgent
 
     public AgentProcess Start(string apiKey, AgentRunSummary run, Workspace workspace, string logPath)
     {
+        var info = Info(apiKey, workspace);
+        AddArguments(info, ["exec", "--json", .. Options(workspace), CodingAgents.Prompt("work-on-issue", run, workspace)]);
+        return new CodexProcess(AgentProcess.Launch(info), logPath);
+    }
+
+    public AgentProcess Resume(string apiKey, string issueKey, Workspace workspace, string sessionId, string instruction, string logPath)
+    {
+        var info = Info(apiKey, workspace);
+        AddArguments(info, ["exec", "--json", .. Options(workspace), "resume", sessionId, instruction]);
+        return new CodexProcess(AgentProcess.Launch(info), logPath);
+    }
+
+    public int ResumeInteractive(string apiKey, string issueKey, Workspace workspace, string sessionId)
+    {
+        var info = Info(apiKey, workspace);
+        AddArguments(info, [.. Options(workspace), "resume", sessionId]);
+        using var process = System.Diagnostics.Process.Start(info)!;
+        process.WaitForExit();
+        return process.ExitCode;
+    }
+
+    private System.Diagnostics.ProcessStartInfo Info(string apiKey, Workspace workspace)
+    {
         var info = new System.Diagnostics.ProcessStartInfo(FindExecutable()) { WorkingDirectory = workspace.Path };
+
+        // env_http_headers reads the key from this variable, so it's never on the command line or in a file.
+        info.Environment[config.ApiKeyEnv] = apiKey;
+        return info;
+    }
+
+    /// <summary>The sandbox, the Boards MCP server and skill, the workspace's folders - the same for a run and a resume.</summary>
+    private List<string> Options(Workspace workspace)
+    {
         var skill = Path.Combine(AgentPlugin.Directory.Value, "skills", "work-on-issue");
         var tools = string.Join(", ", CodingAgents.BoardsTools.Select(Toml));
-        List<string> arguments =
+        List<string> options =
         [
-            "exec",
-            "--json",
-            "--ephemeral",
+            // Not --ephemeral: `lba continue` resumes the session afterwards.
             "--ignore-user-config",
             "--sandbox", "workspace-write",
             "-C", workspace.Path,
@@ -1013,19 +1139,18 @@ sealed class CodexAgent(RunnerConfig config) : ICodingAgent
         ];
         if (config.CodexModel is { Length: > 0 } model)
         {
-            arguments.AddRange(["-m", model]);
+            options.AddRange(["-m", model]);
         }
 
-        arguments.Add(CodingAgents.Prompt("work-on-issue", run, workspace));
+        return options;
+    }
+
+    private static void AddArguments(System.Diagnostics.ProcessStartInfo info, IEnumerable<string> arguments)
+    {
         foreach (var argument in arguments)
         {
             info.ArgumentList.Add(argument);
         }
-
-        // env_http_headers reads the key from this variable, so it's never on the command line or in a file.
-        info.Environment[config.ApiKeyEnv] = apiKey;
-
-        return new CodexProcess(AgentProcess.Launch(info), logPath);
     }
 
     /// <summary>A TOML basic string, for the values of <c>-c key=value</c>.</summary>
@@ -1062,6 +1187,9 @@ sealed class CodexProcess(System.Diagnostics.Process process, string logPath) : 
             var root = message.RootElement;
             switch (root.TryGetProperty("type", out var type) ? type.GetString() : null)
             {
+                case "thread.started":
+                    SessionId = root.TryGetProperty("thread_id", out var thread) ? thread.GetString() : null;
+                    break;
                 case "turn.completed":
                     _turns++;
                     if (root.TryGetProperty("usage", out var usage))
@@ -1362,6 +1490,9 @@ sealed record Workspace(string Path, string Branch, IReadOnlyList<WorkspaceRepo>
 {
     public bool IsMultiRepo => Repos.Count > 1;
 
+    /// <summary>Commits the branch already had when the run started - an earlier run's work this one continues.</summary>
+    public int CommitsSoFar { get; init; }
+
     /// <summary>What the branch starts from - the one repository's, for a single-repository workspace.</summary>
     public string BaseRef => Repos[0].BaseRef;
 }
@@ -1441,6 +1572,199 @@ static class RunsInProgress
     }
 }
 
+/// <summary>
+/// The agent session of an issue's last run on this machine, for `lba continue` - only this machine has it. Kept in
+/// sessions/KEY.json next to the config.
+/// </summary>
+sealed record AgentSession(string IssueKey, string IssueTitle, string IssueUrl, string Agent, string SessionId, RunInProgressWorkspace Workspace);
+
+static class AgentSessions
+{
+    /// <param name="besidePath">A file next to the config (e.g. the run record's): the sessions folder is beside it.</param>
+    public static void Save(string besidePath, AgentSession session)
+    {
+        var path = PathFor(besidePath, session.IssueKey);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, JsonSerializer.Serialize(session, RunnerJson.Default.AgentSession));
+    }
+
+    public static AgentSession? Load(string besidePath, string issueKey)
+    {
+        var path = PathFor(besidePath, issueKey);
+        try
+        {
+            return File.Exists(path) ? JsonSerializer.Deserialize(File.ReadAllText(path), RunnerJson.Default.AgentSession) : null;
+        }
+        catch (Exception e) when (e is IOException or JsonException)
+        {
+            Log.Error($"{path} can't be read: {e.Message}");
+            return null;
+        }
+    }
+
+    private static string PathFor(string besidePath, string issueKey)
+    {
+        return Path.Combine(Path.GetDirectoryName(Path.GetFullPath(besidePath))!, "sessions", $"{issueKey.ToUpperInvariant()}.json");
+    }
+}
+
+/// <summary>
+/// `lba continue KEY ["instruction"]` (BRD-317): keep working on an issue the agent ran here, without the Boards round
+/// trip. Puts the workspace back on the issue's branch, resumes the agent's session - in this terminal, or for one
+/// unattended round with the instruction - and afterwards posts one summary comment (and publishes, if set up).
+/// </summary>
+static class ContinueCommand
+{
+    public static async Task<int> RunAsync(RunnerArgs options, CancellationToken ct)
+    {
+        var config = RunnerConfig.Load(options.ConfigPath);
+        var key = options.IssueKey!;
+        var runFile = RunsInProgress.PathFor(options.ConfigPath);
+        if (AgentSessions.Load(runFile, key) is not { } session)
+        {
+            Console.WriteLine($"There's no agent run of {key} on this computer to continue. Hand it to the agent in Boards first.");
+            return 1;
+        }
+
+        var codingAgent = CodingAgents.All(config).FirstOrDefault(x => x.Key == session.Agent);
+        if (codingAgent is null)
+        {
+            Console.WriteLine($"{key} was run by \"{session.Agent}\", which this version doesn't know.");
+            return 1;
+        }
+
+        if (ApiKeySource.Resolve(config) is not { } apiKey)
+        {
+            Console.WriteLine("No Boards API key: run `lba setup` to sign in.");
+            return 1;
+        }
+
+        var workspace = session.Workspace.ToWorkspace(key);
+        if (!Prepare(workspace))
+        {
+            return 1;
+        }
+
+        var startHeads = workspace.Repos.ToDictionary(x => x.Path, x => Git.ResolveCommit(x.Path, "HEAD"));
+        if (options.Instruction is { } instruction)
+        {
+            var logPath = Path.Combine(config.WorktreeFolder, $"{key}.continue-{DateTime.UtcNow:yyyyMMddHHmmss}.jsonl");
+            Console.WriteLine($"{codingAgent.Name} continues {key} on {workspace.Branch}: \"{instruction}\". Log: {logPath}");
+            using var agent = codingAgent.Resume(apiKey, key, workspace, session.SessionId, Prompt(key, instruction), logPath);
+            var finished = await Task.WhenAny(agent.WaitForExitAsync(), Task.Delay(Timeout.Infinite, ct));
+            if (finished is not Task { IsCompletedSuccessfully: true } || ct.IsCancellationRequested)
+            {
+                agent.Kill();
+                Console.WriteLine("Stopped.");
+            }
+
+            Console.WriteLine(agent.Summary());
+            if (agent.SessionId is { } sessionId && sessionId != session.SessionId)
+            {
+                AgentSessions.Save(runFile, session with { SessionId = sessionId });
+            }
+        }
+        else
+        {
+            Console.WriteLine($"Opening {codingAgent.Name}'s session of {key} on {workspace.Branch}. Exit it when you're done; laraue-boards-agent then posts a summary to the issue.");
+            codingAgent.ResumeInteractive(apiKey, key, workspace, session.SessionId);
+        }
+
+        var changed = workspace.Repos
+            .Select(repo => new { repo, Commits = startHeads[repo.Path] is { } head ? Git.CommitsSince(repo.Path, head) : -1 })
+            .Where(x => x.Commits > 0)
+            .ToList();
+
+        // As after a run: repositories the agent never committed to go back where they were, their empty branch deleted.
+        Workspaces.Finish(workspace);
+        if (changed.Count == 0)
+        {
+            Console.WriteLine("No new commits, so nothing is posted to Boards.");
+            return 0;
+        }
+
+        var run = new AgentRunSummary(0, key, session.IssueTitle, session.IssueUrl, AgentRunStates.Done, DateTime.UtcNow, "", null, null, null, null, false);
+        var published = Publisher.Publish(config, run, workspace);
+        var comment = $"_laraue-boards-agent: continued with {codingAgent.Name} on {Environment.MachineName}"
+            + (options.Instruction is { } asked ? $" (\"{Shorten(asked)}\")" : "")
+            + "_\n\nNew commits:\n"
+            + string.Join("\n", changed.Select(x => $"- {x.repo.Name}: `{workspace.Branch}`, {x.Commits} commit{(x.Commits == 1 ? "" : "s")}"))
+            + (published.Count == 0 ? "" : "\n\nPublished:\n" + string.Join("\n", published.Select(x => $"- {x.Line}")));
+        try
+        {
+            await using var boards = await BoardsClient.ConnectAsync(config.McpUrl, apiKey, ct);
+            await boards.CreateComment(key, comment, ct);
+            Console.WriteLine($"Posted a summary to {key}: {changed.Sum(x => x.Commits)} new commit(s).");
+        }
+        catch (Exception e) when (!ct.IsCancellationRequested)
+        {
+            Console.WriteLine($"Couldn't post the summary to Boards: {e.Message}");
+        }
+
+        var pullRequest = published.Select(x => x.PullRequestUrl).OfType<string>().FirstOrDefault();
+        Notifications.Show(config, $"{key} · ready for review", pullRequest is null ? session.IssueTitle : $"{session.IssueTitle} - {pullRequest}", session.IssueUrl);
+        return 0;
+    }
+
+    /// <summary>
+    /// The issue's branch checked out again: in checkout mode each clone switched to it (asking first about uncommitted
+    /// changes, which are never touched); in worktree mode a removed worktree made again. A repository whose empty
+    /// branch was deleted after the run gets it back from its base.
+    /// </summary>
+    private static bool Prepare(Workspace workspace)
+    {
+        foreach (var repo in workspace.Repos)
+        {
+            if (!workspace.InCheckouts)
+            {
+                if (!Directory.Exists(repo.Path))
+                {
+                    Git.CreateWorktree(repo.ClonePath, repo.BaseRef, repo.Path, workspace.Branch);
+                }
+
+                continue;
+            }
+
+            if (Git.CurrentBranch(repo.Path) == workspace.Branch)
+            {
+                continue;
+            }
+
+            while (Git.UncommittedFiles(repo.Path) is var uncommitted and not 0)
+            {
+                if (!UserPrompt.Ask(
+                        $"{repo.Name} ({repo.Path}) has {(uncommitted < 0 ? "a git status that can't be read" : $"{uncommitted} uncommitted file(s)")}. Commit or stash them to switch it to {workspace.Branch}. Continue?",
+                        yes: "Continue",
+                        no: "Stop"))
+                {
+                    return false;
+                }
+            }
+
+            Git.SwitchToBranch(repo.Path, repo.BaseRef, workspace.Branch);
+            Console.WriteLine($"{repo.Name}: switched to {workspace.Branch}.");
+        }
+
+        return true;
+    }
+
+    private static string Prompt(string issueKey, string instruction)
+    {
+        return $"""
+            {instruction}
+
+            (This continues your work on {issueKey} after its run, outside Boards: commit your changes on the branch as before.
+            Don't change the issue's status or finish an agent run in Boards - laraue-boards-agent posts the summary.)
+            """;
+    }
+
+    private static string Shorten(string text)
+    {
+        var line = text.ReplaceLineEndings(" ").Trim();
+        return line.Length <= 120 ? line : line[..117] + "...";
+    }
+}
+
 static class Workspaces
 {
     /// <summary>How long the title part of a new branch name can get, e.g. agent/BRD-314-sort-epics-in-space-detail-page.</summary>
@@ -1504,7 +1828,7 @@ static class Workspaces
         {
             var repo = space.Repos[0];
             Git.CreateWorktree(repo.ClonePath, repo.BaseRef, root, branch);
-            return new Workspace(root, branch, [ToWorkspaceRepo(repo, root)], space, InCheckouts: false);
+            return WithCommitsSoFar(new Workspace(root, branch, [ToWorkspaceRepo(repo, root)], space, InCheckouts: false));
         }
 
         if (File.Exists(Path.Combine(root, ".git")))
@@ -1522,7 +1846,7 @@ static class Workspaces
             repos.Add(ToWorkspaceRepo(repo, path));
         }
 
-        return new Workspace(root, branch, repos, space, InCheckouts: false);
+        return WithCommitsSoFar(new Workspace(root, branch, repos, space, InCheckouts: false));
     }
 
     /// <summary>
@@ -1549,7 +1873,18 @@ static class Workspaces
             repos.Add(ToWorkspaceRepo(repo, repo.ClonePath) with { PreviousBranch = previous });
         }
 
-        return new Workspace(repos[0].Path, branch, repos, space, InCheckouts: true);
+        return WithCommitsSoFar(new Workspace(repos[0].Path, branch, repos, space, InCheckouts: true));
+    }
+
+    /// <summary>The workspace with <see cref="Workspace.CommitsSoFar"/>: what an earlier run of the issue left on its branch.</summary>
+    private static Workspace WithCommitsSoFar(Workspace workspace)
+    {
+        return workspace with
+        {
+            CommitsSoFar = workspace.Repos
+                .Where(repo => repo.BaseCommit is not null)
+                .Sum(repo => Math.Max(0, Git.CommitsSince(repo.Path, repo.BaseCommit!))),
+        };
     }
 
     /// <summary>
@@ -1816,7 +2151,7 @@ static class Publisher
                 "--head", workspace.Branch,
                 "--base", baseBranch,
                 "--title", $"{run.IssueKey}: {run.IssueTitle}",
-                "--body", $"{run.IssueUrl}\n\nWork of the agent run on {run.IssueKey}, opened by boards-agent. The agent's summary is in the issue's comments.",
+                "--body", $"{run.IssueUrl}\n\nWork of the agent run on {run.IssueKey}, opened by laraue-boards-agent. The agent's summary is in the issue's comments.",
             ]);
         if (create.ExitCode == 0 && LastUrl(create.Output) is { } created)
         {
@@ -2286,16 +2621,21 @@ sealed record RunnerArgs(
     string? McpUrl,
     bool NoBrowser,
     string? ServiceAction,
-    string? LogPath)
+    string? LogPath,
+    string? IssueKey = null,
+    string? Instruction = null)
 {
     public const string SetupCommand = "setup";
+
+    public const string ContinueCommand = "continue";
 
     public const string ServiceCommand = "service";
 
     private const string Usage =
-        "Usage: boards-agent [setup] [--config <file>] [--log <file>] [--once] [--dry-run] [--check] [--version]\n" +
-        "       boards-agent setup [--no-browser] [--web-url <url>] [--api-url <url>] [--mcp-url <url>]\n" +
-        "       boards-agent service install|uninstall|restart|status [--config <file>]";
+        "Usage: lba [--config <file>] [--log <file>] [--once] [--dry-run] [--check] [--version]   (or laraue-boards-agent)\n" +
+        "       lba setup [--no-browser] [--web-url <url>] [--api-url <url>] [--mcp-url <url>]\n" +
+        "       lba continue <issue key> [\"<instruction>\"]\n" +
+        "       lba service install|uninstall|restart|status [--config <file>]";
 
     public static RunnerArgs Parse(string[] args)
     {
@@ -2311,12 +2651,23 @@ sealed record RunnerArgs(
         var noBrowser = false;
         string? serviceAction = null;
         string? logPath = null;
+        string? issueKey = null;
+        string? instruction = null;
         for (var i = 0; i < args.Length; i++)
         {
             switch (args[i])
             {
                 case SetupCommand when i == 0:
                     command = SetupCommand;
+                    break;
+                case ContinueCommand when i == 0 && i + 1 < args.Length:
+                    command = ContinueCommand;
+                    issueKey = args[++i].ToUpperInvariant();
+                    if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
+                    {
+                        instruction = args[++i];
+                    }
+
                     break;
                 case ServiceCommand when i == 0 && i + 1 < args.Length:
                     command = ServiceCommand;
@@ -2362,12 +2713,12 @@ sealed record RunnerArgs(
             throw new ArgumentException($"Unknown service action: {serviceAction}.\n{Usage}");
         }
 
-        return new RunnerArgs(command, configPath, once, dryRun, check, version, webUrl, apiUrl, mcpUrl, noBrowser, serviceAction, logPath);
+        return new RunnerArgs(command, configPath, once, dryRun, check, version, webUrl, apiUrl, mcpUrl, noBrowser, serviceAction, logPath, issueKey, instruction);
     }
 }
 
 /// <summary>
-/// The runner's settings, written by `boards-agent setup` to <see cref="DefaultPath"/>. The API key itself is never
+/// The runner's settings, written by `lba setup` to <see cref="DefaultPath"/>. The API key itself is never
 /// stored there - it's in the OS credential store (<see cref="CredentialStore"/>).
 /// </summary>
 sealed record RunnerConfig
@@ -2503,10 +2854,10 @@ sealed record RunnerConfig
     public static RunnerConfig Load(string path)
     {
         var config = TryLoad(path)
-            ?? throw new FileNotFoundException($"No config at {path}. Run `boards-agent setup` first.");
+            ?? throw new FileNotFoundException($"No config at {path}. Run `lba setup` first.");
         if (config.CodeFolders.Length == 0 && config.Spaces.Count == 0)
         {
-            throw new InvalidOperationException($"{path}: no code folder to find repositories in. Run `boards-agent setup`.");
+            throw new InvalidOperationException($"{path}: no code folder to find repositories in. Run `lba setup`.");
         }
 
         if (!PublishModes.All.Contains(config.Publish, StringComparer.OrdinalIgnoreCase))
@@ -2819,10 +3170,11 @@ sealed record IssueDetail(string Key, string Title, string Status, long? StatusI
 [JsonSerializable(typeof(IssueDetail))]
 [JsonSerializable(typeof(bool))]
 [JsonSerializable(typeof(RunInProgress))]
+[JsonSerializable(typeof(AgentSession))]
 partial class RunnerJson : JsonSerializerContext;
 
 /// <summary>
-/// `boards-agent service`: runs the runner in the background as the signed-in user - where their credential store and
+/// `lba service`: runs the runner in the background as the signed-in user - where their credential store and
 /// Claude Code sign-in are - started at login and restarted if it stops. A launchd LaunchAgent on macOS, a Task Scheduler
 /// logon task on Windows. systemd isn't supported yet.
 /// </summary>
@@ -2853,7 +3205,7 @@ static class Service
     {
         if (!IsSupported)
         {
-            Console.WriteLine("The background service isn't supported on this system yet. Run `boards-agent` in a terminal instead.");
+            Console.WriteLine("The background service isn't supported on this system yet. Run `lba` in a terminal instead.");
             return 1;
         }
 
@@ -2861,7 +3213,7 @@ static class Service
         {
             "install" => Install(options.ConfigPath),
             "uninstall" => Uninstall(),
-            "restart" => RestartCommand(),
+            "restart" => RestartCommand(options.ConfigPath),
             _ => Status(),
         };
     }
@@ -2871,14 +3223,14 @@ static class Service
         var executable = StableExecutablePath();
         if (executable is null)
         {
-            Console.WriteLine("The service needs the installed boards-agent binary, not `dotnet run`.");
+            Console.WriteLine("The service needs the installed laraue-boards-agent binary, not `dotnet run`.");
             return 1;
         }
 
         var config = RunnerConfig.TryLoad(configPath);
         if (config is null || (config.CodeFolders.Length == 0 && config.Spaces.Count == 0) || ApiKeySource.Resolve(config) is null)
         {
-            Console.WriteLine("Run `boards-agent setup` first: the service needs a signed-in config that knows where your code is.");
+            Console.WriteLine("Run `lba setup` first: the service needs a signed-in config that knows where your code is.");
             return 1;
         }
 
@@ -2894,7 +3246,7 @@ static class Service
 
         Console.WriteLine($"The agent runs in the background now, and starts again when you sign in to your {(OperatingSystem.IsWindows() ? "PC" : "Mac")}.");
         Console.WriteLine($"Log: {LogPath}");
-        Console.WriteLine("Hand an issue to the agent in Boards. `boards-agent service status` shows what it's doing.");
+        Console.WriteLine("Hand an issue to the agent in Boards. `lba service status` shows what it's doing.");
         return 0;
     }
 
@@ -2932,13 +3284,21 @@ static class Service
         return 0;
     }
 
-    /// <summary>`boards-agent service restart` - what the install scripts run after an update, so it starts the new binary.</summary>
-    private static int RestartCommand()
+    /// <summary>`lba service restart` - what the install scripts run after an update, so it starts the new binary.</summary>
+    private static int RestartCommand(string configPath)
     {
         if (!IsInstalled)
         {
             Console.WriteLine("The background service isn't installed, so there's nothing to restart.");
             return 0;
+        }
+
+        // Registered for another binary - e.g. boards-agent before the rename to laraue-boards-agent: register it again
+        // for this one, which also starts it.
+        if (StableExecutablePath() is { } executable && !RegisteredFor(executable))
+        {
+            Console.WriteLine("The background service runs another binary - registering it again for this one...");
+            return Install(configPath);
         }
 
         Console.WriteLine("Restarting the background service...");
@@ -2947,11 +3307,20 @@ static class Service
         return 0;
     }
 
+    /// <summary>Whether the installed service starts <paramref name="executable"/>.</summary>
+    private static bool RegisteredFor(string executable)
+    {
+        var definition = OperatingSystem.IsWindows()
+            ? Shell.Run("schtasks", "/Query", "/TN", TaskName, "/XML").Output
+            : File.Exists(PlistPath) ? File.ReadAllText(PlistPath) : "";
+        return definition.Contains(System.Security.SecurityElement.Escape(executable), StringComparison.OrdinalIgnoreCase);
+    }
+
     private static int Status()
     {
         if (!IsInstalled)
         {
-            Console.WriteLine("The background service isn't installed. `boards-agent service install` installs it.");
+            Console.WriteLine("The background service isn't installed. `lba service install` installs it.");
             return 1;
         }
 
@@ -3004,17 +3373,8 @@ static class Service
             return null;
         }
 
-        var cellar = path.IndexOf("/Cellar/boards-agent/", StringComparison.Ordinal);
-        if (cellar > 0)
-        {
-            var linked = Path.Combine(path[..cellar], "bin", "boards-agent");
-            if (File.Exists(linked))
-            {
-                return linked;
-            }
-        }
-
-        return path;
+        // Started through a link (lba, or the old boards-agent name): the service runs the binary itself.
+        return File.ResolveLinkTarget(path, returnFinalTarget: true)?.FullName ?? path;
     }
 
     private static string? InstallLaunchAgent(string executable, string configPath)
@@ -3105,7 +3465,7 @@ static class Service
             <?xml version="1.0" encoding="UTF-16"?>
             <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
               <RegistrationInfo>
-                <Description>boards-agent: works on Laraue Boards issues handed to the agent.</Description>
+                <Description>laraue-boards-agent: works on Laraue Boards issues handed to the agent.</Description>
               </RegistrationInfo>
               <Triggers>
                 <LogonTrigger>
@@ -3402,7 +3762,7 @@ static class BoardsSignIn
                     Console.WriteLine("You denied the sign-in in the browser.");
                     return null;
                 case "Expired":
-                    Console.WriteLine("The sign-in timed out. Run `boards-agent setup` again.");
+                    Console.WriteLine("The sign-in timed out. Run `lba setup` again.");
                     return null;
             }
         }
@@ -3447,7 +3807,7 @@ static class BoardsSignIn
 }
 
 /// <summary>
-/// `boards-agent setup`: picks the coding agent, signs this machine in to Boards (the key goes to the credential store),
+/// `lba setup`: picks the coding agent, signs this machine in to Boards (the key goes to the credential store),
 /// maps spaces to local repositories, and makes sure the agent is signed in. Writes the config; running it again keeps
 /// what's there.
 /// </summary>
@@ -3463,14 +3823,14 @@ static class Setup
             McpUrl = options.McpUrl ?? config.McpUrl,
         };
 
-        Console.WriteLine($"boards-agent {RunnerVersion.Value} setup");
+        Console.WriteLine($"laraue-boards-agent {RunnerVersion.Value} setup");
 
         // 1. Which coding agent works on the issues - before signing in, since the key is named after it.
         var codingAgent = ChooseAgent(config);
         if (codingAgent is null)
         {
             Console.WriteLine("No coding agent is installed. Install Claude Code (https://claude.com/claude-code) or Codex "
-                + "(https://developers.openai.com/codex/cli), then run `boards-agent setup` again.");
+                + "(https://developers.openai.com/codex/cli), then run `lba setup` again.");
             return 1;
         }
 
@@ -3557,7 +3917,7 @@ static class Setup
         }
         catch (FileNotFoundException)
         {
-            Console.WriteLine($"{codingAgent.Name} isn't installed. Install it ({codingAgent.InstallUrl}), then run `boards-agent setup` again.");
+            Console.WriteLine($"{codingAgent.Name} isn't installed. Install it ({codingAgent.InstallUrl}), then run `lba setup` again.");
             return 1;
         }
 
@@ -3567,7 +3927,7 @@ static class Setup
             codingAgent.SignIn(executable);
             if (!codingAgent.IsSignedIn(executable))
             {
-                Console.WriteLine($"{codingAgent.Name} still isn't signed in. Run `boards-agent setup` again once it is.");
+                Console.WriteLine($"{codingAgent.Name} still isn't signed in. Run `lba setup` again once it is.");
                 return 1;
             }
         }
@@ -3576,7 +3936,7 @@ static class Setup
         Console.WriteLine();
         Console.WriteLine(anyRepository
             ? "Done. The agent takes the issues you hand to it in the spaces above that have a repository here."
-            : "No space has a repository on this machine yet, so there's nothing to work on. Add your repositories as links of the space in Boards, then run `boards-agent setup` again.");
+            : "No space has a repository on this machine yet, so there's nothing to work on. Add your repositories as links of the space in Boards, then run `lba setup` again.");
         if (anyRepository && Service.IsSupported)
         {
             if (Service.IsInstalled)
@@ -3592,12 +3952,12 @@ static class Setup
             }
             else
             {
-                Console.WriteLine("Start the runner with `boards-agent`, then hand an issue to the agent in Boards.");
+                Console.WriteLine("Start the runner with `lba`, then hand an issue to the agent in Boards.");
             }
         }
         else if (anyRepository)
         {
-            Console.WriteLine("Start the runner with `boards-agent`, then hand an issue to the agent in Boards.");
+            Console.WriteLine("Start the runner with `lba`, then hand an issue to the agent in Boards.");
         }
 
         return 0;
@@ -3663,7 +4023,7 @@ static class Setup
         Console.WriteLine("  1. Nothing - it stays on this computer, you review it and push it yourself.");
         Console.WriteLine("  2. Push it to the repository's remote.");
         Console.WriteLine("  3. Push it and open a pull request (needs the GitHub CLI, gh, signed in).");
-        Console.WriteLine("  The agent itself never pushes: boards-agent does, after the run is done.");
+        Console.WriteLine("  The agent itself never pushes: laraue-boards-agent does, after the run is done.");
         while (true)
         {
             var answer = Ask($"Number, or Enter for {current}:");

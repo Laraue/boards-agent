@@ -42,17 +42,18 @@ jobs:
             -p:EnableCompressionInSingleFile=true \
             -p:DebugType=none \
             -p:Version="$version" \
-            -o out/boards-agent
+            -p:AssemblyName=laraue-boards-agent \
+            -o out/laraue-boards-agent
 
       - name: Package
         run: |
-          cp README.md LICENSE boards-agent.example.json out/boards-agent/
-          name="boards-agent-${GITHUB_REF_NAME}-${{ matrix.rid }}"
+          cp README.md LICENSE boards-agent.example.json out/laraue-boards-agent/
+          name="laraue-boards-agent-${GITHUB_REF_NAME}-${{ matrix.rid }}"
           mkdir dist
           if [[ "${{ matrix.rid }}" == win-* ]]; then
-            (cd out && zip -r "../dist/$name.zip" boards-agent)
+            (cd out && zip -r "../dist/$name.zip" laraue-boards-agent)
           else
-            tar -czf "dist/$name.tar.gz" -C out boards-agent
+            tar -czf "dist/$name.tar.gz" -C out laraue-boards-agent
           fi
 
       - uses: actions/upload-artifact@v4

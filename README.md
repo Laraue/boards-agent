@@ -1,6 +1,6 @@
-# boards-agent
+# laraue-boards-agent (lba)
 
-Hand a [Laraue Boards](https://boards.laraue.com) issue to a coding agent - Claude Code or OpenAI Codex - running on your own machine.
+Hand a [Laraue Boards](https://boards.laraue.com) issue to a coding agent - Claude Code or OpenAI Codex - running on your own machine. The command is `laraue-boards-agent`, or `lba` for short (before 0.4 it was `boards-agent`, which an update keeps as a link).
 
 You click **Hand to agent** on an issue assigned to you. boards-agent, running on your computer with your API key, picks the issue up. It puts the work on branch `agent/<KEY>-<title>` (e.g. `agent/BRD-314-sort-epics-in-space-detail-page`; a re-run of the issue reuses its branch even if the issue was renamed) - in a separate git worktree, or in your own clone if you prefer (see [Where the agent works](#where-the-agent-works)) - and runs the agent there. When the agent is done, the issue is in Review with a summary of what changed, and you get a notification. By default nothing is pushed: you review the branch and push it yourself - or let boards-agent push it and open a pull request (see [When the agent is done](#when-the-agent-is-done)).
 
@@ -37,7 +37,8 @@ Setup asks; the `workspace` setting in the config holds the answer.
   - `push`: after a run ends Done, boards-agent pushes the issue's branch in every repository the agent committed to.
   - `pr`: it also opens a pull request with the [GitHub CLI](https://cli.github.com) (`gh`, signed in), or finds the one an earlier run of the issue opened.
   The runner's comment on the issue and the review notification carry the branches and pull requests. The agent itself still can't push: boards-agent does, after the run.
-- **Feedback.** In Boards, **Send back to agent** on an issue under review takes your comment, moves the issue back and hands it off again; the next run continues on the same branch and follows your comments.
+- **Feedback, right here: `lba continue <KEY>`.** Opens the agent's session of that issue in your terminal - the same Claude Code or Codex conversation, with everything it knew, in the same repositories and on the issue's branch. Talk to it ("the button is still blue", "add a test"), see the changes and run the app straight away: no status changes in Boards, no waiting. `lba continue <KEY> "make the button red"` does one round without you, unattended like a run. When you're done, one summary comment with the new commits goes to the issue (and with `publish` on, the branch is pushed and the pull request updated). In checkout mode, your clones are switched back to the issue's branch first, asking about uncommitted changes as a run does. Only the computer that ran the issue has its session.
+- **Feedback from Boards.** **Send back to agent** on an issue under review takes your comment, moves the issue back and hands it off again; the next run continues on the same branch ("continuing ... (N commits so far)") and follows your comments. Handy when you're away from the computer.
 
 ## Safety
 
@@ -46,11 +47,11 @@ Setup asks; the `workspace` setting in the config holds the answer.
 - `git push`, `gh`, `WebFetch` and `WebSearch` are always denied to the agent. Pushing and pull requests, when you turn them on (`publish`), are done by boards-agent itself after the run.
 - Only the Boards MCP server is loaded, with only the tools the agent needs: Claude Code with `--strict-mcp-config` and only the repository's project settings (`--setting-sources project`), Codex with `--ignore-user-config`, so your own `~/.codex/config.toml` isn't used.
 - The skill takes instructions only from the issue text and the assignee's own comments. Comments by anyone else are treated as untrusted data.
-- Your API key is issued by Boards when you click Allow during `boards-agent setup`, and kept in the macOS Keychain, the Windows Credential Manager, or the Secret Service on Linux. It's never shown or written to a file. The agent gets it through its environment (`BOARDS_AGENT_API_KEY`), which its MCP connection reads; Codex's commands don't see it.
+- Your API key is issued by Boards when you click Allow during `lba setup`, and kept in the macOS Keychain, the Windows Credential Manager, or the Secret Service on Linux. It's never shown or written to a file. The agent gets it through its environment (`BOARDS_AGENT_API_KEY`), which its MCP connection reads; Codex's commands don't see it.
 
 ## Install
 
-You need git and a coding agent: [Claude Code](https://claude.com/claude-code) (or the Claude desktop app, which bundles it) or [Codex](https://developers.openai.com/codex/cli). Then run one command; it installs boards-agent and starts `boards-agent setup`.
+You need git and a coding agent: [Claude Code](https://claude.com/claude-code) (or the Claude desktop app, which bundles it) or [Codex](https://developers.openai.com/codex/cli). Then run one command; it installs boards-agent and starts `lba setup`.
 
 macOS and Linux:
 
@@ -64,13 +65,13 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/Laraue/boards-agent/main/install.ps1 | iex
 ```
 
-The script downloads the newest release for your system, checks it against the release's `SHA256SUMS`, and puts the binary in `~/.local/bin` (`%LOCALAPPDATA%\Programs\boards-agent` on Windows), adding that folder to your PATH. Running it again updates boards-agent and restarts the background service, without asking setup's questions again (run `boards-agent setup` yourself to change them). Each release is a single self-contained binary, with no .NET needed; you can also download it from [Releases](https://github.com/Laraue/boards-agent/releases) yourself.
+The script downloads the newest release for your system, checks it against the release's `SHA256SUMS`, and puts the binary in `~/.local/bin` (`%LOCALAPPDATA%\Programs\boards-agent` on Windows), adding that folder to your PATH. Running it again updates boards-agent and restarts the background service, without asking setup's questions again (run `lba setup` yourself to change them). Each release is a single self-contained binary, with no .NET needed; you can also download it from [Releases](https://github.com/Laraue/boards-agent/releases) yourself.
 
 After setup, you don't run anything: click **Hand to agent** on an issue assigned to you in Boards.
 
 ## Setup
 
-Run `boards-agent setup`, ideally from inside the repository you want the agent to work in. It:
+Run `lba setup`, ideally from inside the repository you want the agent to work in. It:
 
 1. Picks the coding agent: the one you have installed, or asks when you have both.
 2. Opens Boards in your browser. Check the code, pick the organization and click **Allow**. Boards creates an API key named after the agent and your machine, e.g. "Claude Code agent (MacBook)", and hands it to the runner, which keeps it in the Keychain. You can revoke the key any time under Account -> API keys.
@@ -86,17 +87,17 @@ The macOS binaries aren't notarized yet. If macOS refuses to open the binary, al
 
 ## Background service
 
-`boards-agent service install` runs the runner in the background as you, starting it now and whenever you sign in, and restarting it if it stops. Setup offers to do this for you.
+`lba service install` runs the runner in the background as you, starting it now and whenever you sign in, and restarting it if it stops. Setup offers to do this for you.
 
 - macOS: a launchd LaunchAgent. It keeps the `PATH` of the terminal you install it from, so the agent finds your build tools. Log: `~/Library/Logs/boards-agent/boards-agent.log`.
 - Windows: a Task Scheduler task that runs at logon, without a window. Log: `%LOCALAPPDATA%\boards-agent\boards-agent.log`.
-- Linux (systemd) isn't supported yet: run `boards-agent` in a terminal there.
+- Linux (systemd) isn't supported yet: run `lba` in a terminal there.
 
-`boards-agent service status` shows whether it runs and the end of its log; `boards-agent service restart` restarts it (the install script does after an update); `boards-agent service uninstall` removes it. Stopping the service on macOS fails a run in progress, so the issue isn't left locked. On Windows a stopped task can't report that: cancel the run in Boards.
+`lba service status` shows whether it runs and the end of its log; `lba service restart` restarts it (the install script does after an update); `lba service uninstall` removes it. Stopping the service on macOS fails a run in progress, so the issue isn't left locked. On Windows a stopped task can't report that: cancel the run in Boards.
 
 ## Commands
 
-`boards-agent` runs in the foreground. `--check` prints the version, which agent it found, and who your key signs in as. `--dry-run` lists Ready runs without claiming them. `--once` polls once and exits.
+`lba` (or `laraue-boards-agent`) runs in the foreground. `--check` prints the version, which agent it found, and who your key signs in as. `--dry-run` lists Ready runs without claiming them. `--once` polls once and exits.
 
 ## Release
 
