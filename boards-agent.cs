@@ -736,6 +736,9 @@ abstract class AgentProcess : IDisposable
     /// <summary>How the agent ended, for the log and the issue comment: outcome, turns, cost.</summary>
     public abstract string Summary();
 
+    /// <summary>The agent's last message to the person - its answer; null when it said nothing.</summary>
+    public abstract string? FinalMessage();
+
     /// <summary>One line of the agent's stdout, already written to the log.</summary>
     protected abstract void OnOutputLine(string line);
 
@@ -1007,6 +1010,24 @@ sealed class ClaudeCodeProcess(System.Diagnostics.Process process, string logPat
         }
     }
 
+    public override string? FinalMessage()
+    {
+        if (_resultLine is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            using var result = JsonDocument.Parse(_resultLine);
+            return result.RootElement.TryGetProperty("result", out var text) ? text.GetString() : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
     protected override void OnOutputLine(string line)
     {
         if (IsResult(line))
@@ -1178,9 +1199,15 @@ sealed class CodexAgent(RunnerConfig config) : ICodingAgent
 sealed class CodexProcess(System.Diagnostics.Process process, string logPath) : AgentProcess(process, logPath)
 {
     private int _turns;
+    private string? _lastMessage;
     private long _inputTokens;
     private long _outputTokens;
     private string? _error;
+
+    public override string? FinalMessage()
+    {
+        return _lastMessage;
+    }
 
     public override string Summary()
     {
@@ -1198,6 +1225,12 @@ sealed class CodexProcess(System.Diagnostics.Process process, string logPath) : 
             var root = message.RootElement;
             switch (root.TryGetProperty("type", out var type) ? type.GetString() : null)
             {
+                case "item.completed"
+                    when root.TryGetProperty("item", out var item)
+                        && item.TryGetProperty("type", out var itemType)
+                        && itemType.GetString() == "agent_message":
+                    _lastMessage = item.TryGetProperty("text", out var messageText) ? messageText.GetString() : _lastMessage;
+                    break;
                 case "thread.started":
                     SessionId = root.TryGetProperty("thread_id", out var thread) ? thread.GetString() : null;
                     break;
@@ -1667,6 +1700,14 @@ static class ContinueCommand
             {
                 agent.Kill();
                 Console.WriteLine("Stopped.");
+            }
+
+            // Its answer belongs on the screen, not only in the log - e.g. something it was asked to print.
+            if (agent.FinalMessage() is { Length: > 0 } answer)
+            {
+                Console.WriteLine();
+                Console.WriteLine(answer);
+                Console.WriteLine();
             }
 
             Console.WriteLine(agent.Summary());
