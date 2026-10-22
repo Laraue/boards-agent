@@ -215,7 +215,7 @@ static bool CheckoutsReady(SpaceContext space, AgentRunSummary run)
 {
     while (true)
     {
-        var problems = Checkouts.Problems(space)
+        var problems = Checkouts.Problems(space, Workspaces.BranchName(space, run.IssueKey, run.IssueTitle))
             .Where(x => x.HasChanges)
             .ToList();
         if (problems.Count == 0)
@@ -1952,7 +1952,8 @@ static class Workspaces
         var branch = BranchName(space, issueKey, issueTitle);
         foreach (var repo in space.Repos)
         {
-            if (Git.UncommittedFiles(repo.ClonePath) > 0)
+            // Changes on the issue's own branch are the agent's unfinished work, which this run continues.
+            if (Git.CurrentBranch(repo.ClonePath) != branch && Git.UncommittedFiles(repo.ClonePath) > 0)
             {
                 throw new InvalidOperationException($"{repo.Name} ({repo.ClonePath}) has uncommitted changes");
             }
@@ -1961,7 +1962,9 @@ static class Workspaces
         var repos = new List<WorkspaceRepo>();
         foreach (var repo in space.Repos)
         {
-            var previous = Git.CurrentBranch(repo.ClonePath);
+            // Already on the issue's branch (an earlier run of it): nothing to go back to afterwards.
+            var current = Git.CurrentBranch(repo.ClonePath);
+            var previous = current == branch ? null : current;
             Git.SwitchToBranch(repo.ClonePath, repo.BaseRef, branch);
             repos.Add(ToWorkspaceRepo(repo, repo.ClonePath) with { PreviousBranch = previous });
         }
@@ -2063,13 +2066,22 @@ static class Checkouts
     /// One line per clone that isn't ready to be switched: uncommitted changes, or a branch other than the default one
     /// (e.g. the previous issue's, still under review). Empty when every clone is clean and on its default branch.
     /// </summary>
-    public static IReadOnlyList<CheckoutProblem> Problems(SpaceContext space)
+    /// <param name="issueBranch">
+    /// The issue's own branch: a clone already on it is no problem whatever it has - uncommitted changes there are the
+    /// agent's unfinished work on this issue (a run cut off by its turn limit), which the next run continues.
+    /// </param>
+    public static IReadOnlyList<CheckoutProblem> Problems(SpaceContext space, string issueBranch)
     {
         var problems = new List<CheckoutProblem>();
         foreach (var repo in space.Repos)
         {
-            var uncommitted = Git.UncommittedFiles(repo.ClonePath);
             var branch = Git.CurrentBranch(repo.ClonePath);
+            if (branch == issueBranch)
+            {
+                continue;
+            }
+
+            var uncommitted = Git.UncommittedFiles(repo.ClonePath);
             var defaultBranch = DefaultBranch(repo.BaseRef);
             var issues = new List<string>();
             if (uncommitted != 0)
