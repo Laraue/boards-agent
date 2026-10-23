@@ -12,7 +12,7 @@ You click **Hand to agent** on an issue assigned to you. boards-agent, running o
    - reads the issue, its comments and its links
    - posts a plan, commits on the branch, and runs the build and tests
    - posts a summary, moves the issue to Review, and finishes the run
-4. While the agent works, boards-agent checks for a cancel every 30 s and stops the agent if the run was cancelled or the timeout passed. A dropped connection to Boards is retried at the next check, not the end of the run. If boards-agent itself stops while the agent works (a crash, a restart of the computer), it fails that run as soon as it starts again, with a comment saying which branches have commits, so the issue isn't left locked.
+4. While the agent works, boards-agent checks for a cancel every 30 s and stops the agent if the run was cancelled or the timeout passed. A dropped connection to Boards is retried at the next check, not the end of the run. If the runner itself stops while the agent works - an update, a restart of the service or the computer, a crash - the run stays Working and the runner resumes the agent's session when it starts again, with the work so far; after three such resumes it fails the run instead, so the issue isn't left locked. When the agent stops at its turn limit (`maxTurns`) without finishing, the runner continues its session for up to `maxContinuations` more rounds (2 by default) before failing the run; the timeout still bounds the whole run.
 
 While a run is open, the issue is locked: it can't be edited or deleted. Status changes and comments still work, and anyone with edit rights can cancel the run.
 

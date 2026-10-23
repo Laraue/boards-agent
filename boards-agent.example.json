@@ -36,6 +36,8 @@
   "codexNetworkAccess": false,
   // Limits for one run: Claude Code's --max-turns and --max-budget-usd, and a wall-clock timeout (Codex: the timeout only).
   "maxTurns": 150,
+  // More rounds for a run that stops at maxTurns without finishing: the runner resumes the agent's session.
+  "maxContinuations": 2,
   "maxBudgetUsd": 5,
   "timeoutMinutes": 60,
   // Claude Code only: what it may run without asking, besides editing files in the worktree. Everything else is denied;

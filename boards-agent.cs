@@ -128,7 +128,7 @@ try
         {
             if (!options.DryRun)
             {
-                await runner.FailInterruptedRun(stop.Token);
+                await runner.RecoverInterruptedRun(stop.Token);
             }
 
             var runs = await boards.ListReadyRuns(spaceKey: null, me.User.Id, stop.Token);
@@ -293,18 +293,27 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
             return true;
         }
 
-        // Not in a finally: when Work throws, the record stays, so FailInterruptedRun finishes the run.
-        await Work(run, workspace, ct);
-        RunsInProgress.Clear(runFilePath);
+        // Not in a finally: when Work throws or the runner is stopped, the record stays, so RecoverInterruptedRun picks
+        // the run up when the runner starts again.
+        if (!await Work(run, workspace, resumeSessionId: null, ct))
+        {
+            RunsInProgress.Clear(runFilePath);
+        }
+
         return true;
     }
 
+    /// <summary>A run is resumed after the runner stopped at most this many times, then failed.</summary>
+    private const int MaxResumes = 3;
+
     /// <summary>
-    /// Fails the run this machine was working on when the runner stopped without finishing it - it crashed, the computer
-    /// restarted, or Boards stopped answering - so the issue isn't left locked. The agent stopped with the runner (it's
-    /// in its process group). A run that ended meanwhile is just forgotten.
+    /// Picks up the run this machine was working on when the runner stopped - an update or restart of the service, a
+    /// reboot, a crash: while Boards still has it Working, the agent's session is resumed in the same workspace, on the
+    /// same branch with its changes, so the work goes on instead of being thrown away. Without a workspace, or after
+    /// <see cref="MaxResumes"/> resumes, the run is failed with what's on its branches, so the issue isn't left locked.
+    /// A run that ended meanwhile is just forgotten.
     /// </summary>
-    public async Task FailInterruptedRun(CancellationToken ct)
+    public async Task RecoverInterruptedRun(CancellationToken ct)
     {
         if (RunsInProgress.Load(runFilePath) is not { } saved)
         {
@@ -312,124 +321,204 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
         }
 
         var issue = await boards.GetIssue(saved.IssueKey, ct);
-        if (issue.LatestAgentRun is { } run && run.Id == saved.RunId && run.State == AgentRunStates.Working)
+        if (issue.LatestAgentRun is not { } run || run.Id != saved.RunId || run.State != AgentRunStates.Working)
         {
-            Log.Info($"{saved.IssueKey}: run {saved.RunId} was still Working when the runner stopped - failing it.");
-            var branches = "";
-            if (saved.Workspace?.ToWorkspace(saved.IssueKey) is { } workspace)
-            {
-                var changed = Workspaces.Finish(workspace);
-                branches = changed.Count == 0
-                    ? "\n\nNo repository got commits."
-                    : "\n\nBranches with commits:\n" + string.Join("\n", changed.Select(x => $"- {x}"));
-            }
-
-            await Fail(
-                run,
-                "The runner stopped during the work",
-                $"laraue-boards-agent on {Environment.MachineName} stopped while the agent was working (it crashed or was restarted), so the work was cut off. What the agent did so far stays on its branch." + branches);
+            RunsInProgress.Clear(runFilePath);
+            return;
         }
 
+        var workspace = saved.Workspace?.ToWorkspace(saved.IssueKey);
+        if (workspace is not null && saved.Resumes < MaxResumes && (!workspace.InCheckouts || ContinueCommand.Prepare(workspace)))
+        {
+            Log.Info($"{saved.IssueKey}: run {saved.RunId} was interrupted when the runner stopped - resuming it (attempt {saved.Resumes + 1}).");
+            RunsInProgress.Save(runFilePath, saved with { Resumes = saved.Resumes + 1 });
+            if (!await Work(run, workspace, saved.SessionId, ct))
+            {
+                RunsInProgress.Clear(runFilePath);
+            }
+
+            return;
+        }
+
+        Log.Info($"{saved.IssueKey}: run {saved.RunId} was still Working when the runner stopped and can't be resumed - failing it.");
+        var branches = "";
+        if (workspace is not null)
+        {
+            var changed = Workspaces.Finish(workspace);
+            branches = changed.Count == 0
+                ? "\n\nNo repository got commits."
+                : "\n\nBranches with commits:\n" + string.Join("\n", changed.Select(x => $"- {x}"));
+        }
+
+        await Fail(
+            run,
+            "The runner stopped during the work",
+            $"laraue-boards-agent on {Environment.MachineName} stopped while the agent was working and couldn't resume it, so the work was cut off. What the agent did so far stays on its branch." + branches);
         RunsInProgress.Clear(runFilePath);
     }
 
     /// <summary>
-    /// Runs the coding agent in the worktree until it exits, the run is cancelled, or the timeout passes. The agent
-    /// reports and finishes the run itself; the runner only finishes it when the agent couldn't.
+    /// Runs the coding agent in the worktree until the run ends: the agent finishes it, it's cancelled, or the timeout
+    /// passes. A round that stops at the turn limit is continued by resuming the session (up to
+    /// <see cref="RunnerConfig.MaxContinuations"/> times). <paramref name="resumeSessionId"/>: resume that session
+    /// instead of starting the agent - the runner was restarted mid-run. Returns true when the runner itself was stopped:
+    /// the run stays Working and its record is kept, so the next start resumes it.
     /// </summary>
-    private async Task Work(AgentRunSummary run, Workspace workspace, CancellationToken ct)
+    private async Task<bool> Work(AgentRunSummary run, Workspace workspace, string? resumeSessionId, CancellationToken ct)
     {
         var logPath = Path.Combine(config.WorktreeFolder, $"{run.IssueKey}.run-{run.Id}.jsonl");
-        using var agent = codingAgent.Start(apiKey, run, workspace, logPath);
-
-        // However the run ends: what the agent didn't commit to is put back, and the runner's comment says which
-        // branches have commits - right even if the agent's own summary misses one.
-        string? branches = null;
-        string Branches()
+        var sessionId = resumeSessionId;
+        var agent = resumeSessionId is null
+            ? codingAgent.Start(apiKey, run, workspace, logPath)
+            : codingAgent.Resume(apiKey, run.IssueKey, workspace, resumeSessionId, ResumePrompt(run, "laraue-boards-agent was restarted while you were working, so you were interrupted."), logPath);
+        try
         {
-            if (branches is null)
+            // The session goes into the run record as soon as the agent says it, so a restart - or a crash - can resume it.
+            void RecordSession()
             {
-                // Every ending passes here once: the session is kept for `lba continue`.
-                if (agent.SessionId is { } sessionId)
+                if (agent.SessionId is { } id && id != sessionId)
+                {
+                    sessionId = id;
+                    if (RunsInProgress.Load(runFilePath) is { } record && record.RunId == run.Id)
+                    {
+                        RunsInProgress.Save(runFilePath, record with { SessionId = id });
+                    }
+                }
+            }
+
+            void SaveSession()
+            {
+                RecordSession();
+                if (sessionId is not null)
                 {
                     AgentSessions.Save(
                         runFilePath,
                         new AgentSession(run.IssueKey, run.IssueTitle, run.IssueUrl, codingAgent.Key, sessionId, RunInProgressWorkspace.Of(workspace)));
                 }
-
-                var changed = Workspaces.Finish(workspace);
-                branches = !workspace.IsMultiRepo && !workspace.InCheckouts
-                    ? ""
-                    : changed.Count == 0
-                        ? "\n\nNo repository got commits."
-                        : "\n\nBranches with commits:\n" + string.Join("\n", changed.Select(x => $"- {x}"));
             }
 
-            return branches;
-        }
-        Log.Info($"{run.IssueKey}: {codingAgent.Name} started (pid {agent.ProcessId}), log {logPath}.");
-        Notifications.Show(config, $"{run.IssueKey} · agent started", run.IssueTitle, run.IssueUrl);
+            // However the run ends: what the agent didn't commit to is put back, and the runner's comment says which
+            // branches have commits - right even if the agent's own summary misses one.
+            string? branches = null;
+            string Branches()
+            {
+                if (branches is null)
+                {
+                    // Every ending passes here once: the session is kept for `lba continue`.
+                    SaveSession();
+                    var changed = Workspaces.Finish(workspace);
+                    branches = !workspace.IsMultiRepo && !workspace.InCheckouts
+                        ? ""
+                        : changed.Count == 0
+                            ? "\n\nNo repository got commits."
+                            : "\n\nBranches with commits:\n" + string.Join("\n", changed.Select(x => $"- {x}"));
+                }
 
-        var deadline = DateTime.UtcNow.AddMinutes(config.TimeoutMinutes);
-        while (true)
+                return branches;
+            }
+
+            Log.Info($"{run.IssueKey}: {codingAgent.Name} {(resumeSessionId is null ? "started" : "resumed")} (pid {agent.ProcessId}), log {logPath}.");
+            if (resumeSessionId is null)
+            {
+                Notifications.Show(config, $"{run.IssueKey} · agent started", run.IssueTitle, run.IssueUrl);
+            }
+
+            var deadline = DateTime.UtcNow.AddMinutes(config.TimeoutMinutes);
+            var continuations = 0;
+            while (true)
+            {
+                Task tick = Task.Delay(TimeSpan.FromSeconds(config.CancelCheckSeconds), CancellationToken.None);
+                Task exited = agent.WaitForExitAsync();
+                var stopped = Task.Delay(Timeout.Infinite, ct);
+                var first = await Task.WhenAny(exited, tick, stopped);
+                RecordSession();
+
+                if (first == stopped)
+                {
+                    // The service is being restarted or the computer shut down: keep the run, resume it on the next start.
+                    agent.Kill();
+                    SaveSession();
+                    Log.Info($"{run.IssueKey}: the runner was stopped - {codingAgent.Name} stopped; run {run.Id} stays Working and resumes when the runner starts again.");
+                    return true;
+                }
+
+                if (first == exited)
+                {
+                    var finalState = await GetRunState(run, CancellationToken.None);
+                    Log.Info($"{run.IssueKey}: {codingAgent.Name} exited ({agent.ExitCode}), run {run.Id} is {finalState}. {agent.Summary()}");
+                    if (finalState == AgentRunStates.Working
+                        && agent.HitTurnLimit
+                        && continuations < config.MaxContinuations
+                        && DateTime.UtcNow < deadline
+                        && sessionId is not null)
+                    {
+                        continuations++;
+                        Log.Info($"{run.IssueKey}: out of turns - continuing the session (round {continuations + 1}).");
+                        agent.Dispose();
+                        agent = codingAgent.Resume(apiKey, run.IssueKey, workspace, sessionId, ResumePrompt(run, "You ran out of turns before finishing."), logPath);
+                        continue;
+                    }
+
+                    await Finished(run, workspace, agent, finalState, Branches);
+                    return false;
+                }
+
+                if (DateTime.UtcNow >= deadline)
+                {
+                    agent.Kill();
+                    Log.Info($"{run.IssueKey}: timed out after {config.TimeoutMinutes} min - {codingAgent.Name} killed.");
+                    await Fail(run, $"Timed out after {config.TimeoutMinutes} min", agent.Summary() + Branches());
+                    return false;
+                }
+
+                string? state;
+                try
+                {
+                    state = await GetRunState(run, ct);
+                }
+                catch (Exception e) when (!ct.IsCancellationRequested)
+                {
+                    // A dropped connection mustn't end the run: the agent keeps working, the next check tries again.
+                    Log.Error($"{run.IssueKey}: couldn't check the run ({e.GetType().Name}: {e.Message}) - checking again in {config.CancelCheckSeconds} s.");
+                    continue;
+                }
+
+                if (state == AgentRunStates.Cancelled)
+                {
+                    agent.Kill();
+                    Log.Info($"{run.IssueKey}: run {run.Id} was cancelled - {codingAgent.Name} killed.");
+                    Branches();
+                    Notifications.Show(config, $"{run.IssueKey} · agent run cancelled", run.IssueTitle, run.IssueUrl);
+                    return false;
+                }
+            }
+        }
+        finally
         {
-            Task tick = Task.Delay(TimeSpan.FromSeconds(config.CancelCheckSeconds), CancellationToken.None);
-            Task exited = agent.WaitForExitAsync();
-            var stopped = Task.Delay(Timeout.Infinite, ct);
-            var first = await Task.WhenAny(exited, tick, stopped);
-
-            if (first == exited)
-            {
-                break;
-            }
-
-            if (first == stopped)
-            {
-                agent.Kill();
-                Log.Info($"{run.IssueKey}: the runner was stopped - {codingAgent.Name} killed.");
-                await Fail(run, "The runner was stopped", "laraue-boards-agent was shut down on the developer's machine before the work was finished." + Branches());
-                return;
-            }
-
-            if (DateTime.UtcNow >= deadline)
-            {
-                agent.Kill();
-                Log.Info($"{run.IssueKey}: timed out after {config.TimeoutMinutes} min - {codingAgent.Name} killed.");
-                await Fail(run, $"Timed out after {config.TimeoutMinutes} min", agent.Summary() + Branches());
-                return;
-            }
-
-            string? state;
-            try
-            {
-                state = await GetRunState(run, ct);
-            }
-            catch (Exception e) when (!ct.IsCancellationRequested)
-            {
-                // A dropped connection mustn't end the run: the agent keeps working, the next check tries again.
-                Log.Error($"{run.IssueKey}: couldn't check the run ({e.GetType().Name}: {e.Message}) - checking again in {config.CancelCheckSeconds} s.");
-                continue;
-            }
-
-            if (state == AgentRunStates.Cancelled)
-            {
-                agent.Kill();
-                Log.Info($"{run.IssueKey}: run {run.Id} was cancelled - {codingAgent.Name} killed.");
-                Branches();
-                Notifications.Show(config, $"{run.IssueKey} · agent run cancelled", run.IssueTitle, run.IssueUrl);
-                return;
-            }
+            agent.Dispose();
         }
+    }
 
-        var finalState = await GetRunState(run, CancellationToken.None);
-        Log.Info($"{run.IssueKey}: {codingAgent.Name} exited ({agent.ExitCode}), run {run.Id} is {finalState}. {agent.Summary()}");
+    /// <summary>The prompt that resumes the run's session: why it stopped, and to carry on with the same task.</summary>
+    private static string ResumePrompt(AgentRunSummary run, string why)
+    {
+        return $"""
+            {why} Continue working on {run.IssueKey} (agent run id: {run.Id}) from where you stopped - your changes so far are on
+            the branch, committed or not. Finish the task as the work-on-issue skill says: commit, post the summary, move the
+            issue to review and finish the agent run.
+            """;
+    }
+
+    /// <summary>The agent exited and the run won't be continued: report it as it ended.</summary>
+    private async Task Finished(AgentRunSummary run, Workspace workspace, AgentProcess agent, string? finalState, Func<string> branches)
+    {
         if (finalState == AgentRunStates.Working)
         {
-            await Fail(run, $"{codingAgent.Name} stopped without finishing", $"Exit code {agent.ExitCode}. {agent.Summary()}" + Branches());
+            await Fail(run, $"{codingAgent.Name} stopped without finishing", $"Exit code {agent.ExitCode}. {agent.Summary()}" + branches());
         }
         else if (finalState is AgentRunStates.Done or AgentRunStates.Failed)
         {
-            var branchesText = Branches();
+            var branchesText = branches();
             var published = finalState == AgentRunStates.Done ? Publisher.Publish(config, run, workspace) : [];
             var publishedText = published.Count == 0 ? "" : "\n\nPublished:\n" + string.Join("\n", published.Select(x => $"- {x.Line}"));
 
@@ -448,6 +537,10 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
             {
                 Notifications.Show(config, $"{run.IssueKey} · agent failed", run.FailureReason ?? run.IssueTitle, run.IssueUrl);
             }
+        }
+        else
+        {
+            branches();
         }
     }
 
@@ -739,6 +832,9 @@ abstract class AgentProcess : IDisposable
     /// <summary>The agent's last message to the person - its answer; null when it said nothing.</summary>
     public abstract string? FinalMessage();
 
+    /// <summary>The agent stopped at its turn limit (Claude Code's error_max_turns), not because it was done or stuck.</summary>
+    public virtual bool HitTurnLimit => false;
+
     /// <summary>One line of the agent's stdout, already written to the log.</summary>
     protected abstract void OnOutputLine(string line);
 
@@ -1013,6 +1109,8 @@ sealed class ClaudeCodeProcess(System.Diagnostics.Process process, string logPat
             return "Claude Code's result couldn't be read.";
         }
     }
+
+    public override bool HitTurnLimit => _resultLine?.Contains("\"error_max_turns\"", StringComparison.Ordinal) == true;
 
     public override string? FinalMessage()
     {
@@ -1563,7 +1661,9 @@ sealed record WorkspaceRepo(
 
 /// <summary>The run this machine is working on, see <see cref="RunsInProgress"/>.</summary>
 /// <param name="Workspace">Null until the workspace exists.</param>
-sealed record RunInProgress(long RunId, string IssueKey, RunInProgressWorkspace? Workspace);
+/// <param name="SessionId">The agent's session, as soon as it said it - what a restarted runner resumes.</param>
+/// <param name="Resumes">How many times the run was already resumed after the runner stopped.</param>
+sealed record RunInProgress(long RunId, string IssueKey, RunInProgressWorkspace? Workspace, string? SessionId = null, int Resumes = 0);
 
 /// <summary>What <see cref="Workspaces.Finish"/> needs of a <see cref="Workspace"/>, to put it back after a crash.</summary>
 sealed record RunInProgressWorkspace(string Path, string Branch, bool InCheckouts, IReadOnlyList<WorkspaceRepo> Repos)
@@ -1582,7 +1682,7 @@ sealed record RunInProgressWorkspace(string Path, string Branch, bool InCheckout
 
 /// <summary>
 /// The run in progress, in a file next to the config (current-run.json): written when a run is claimed, removed when
-/// it ends. Still there when the runner starts means the last run was cut off (<see cref="Runner.FailInterruptedRun"/>).
+/// it ends. Still there when the runner starts means the last run was cut off (<see cref="Runner.RecoverInterruptedRun"/>).
 /// </summary>
 static class RunsInProgress
 {
@@ -1808,7 +1908,7 @@ static class ContinueCommand
     /// changes, which are never touched); in worktree mode a removed worktree made again. A repository whose empty
     /// branch was deleted after the run gets it back from its base.
     /// </summary>
-    private static bool Prepare(Workspace workspace)
+    internal static bool Prepare(Workspace workspace)
     {
         foreach (var repo in workspace.Repos)
         {
@@ -3016,6 +3116,12 @@ sealed record RunnerConfig
 
     /// <summary>Claude Code's --max-budget-usd, if the installed version supports it. Not available for Codex.</summary>
     public decimal? MaxBudgetUsd { get; set; }
+
+    /// <summary>
+    /// How many more rounds a run gets when the agent stops at <see cref="MaxTurns"/> without finishing: the runner
+    /// resumes its session to continue. The timeout still bounds the whole run. Claude Code only.
+    /// </summary>
+    public int MaxContinuations { get; set; } = 2;
 
     /// <summary>A run taking longer than this is stopped and failed.</summary>
     public int TimeoutMinutes { get; set; } = 60;
