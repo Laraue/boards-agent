@@ -215,7 +215,7 @@ static bool CheckoutsReady(SpaceContext space, AgentRunSummary run)
 {
     while (true)
     {
-        var problems = Checkouts.Problems(space)
+        var problems = Checkouts.Problems(space, Workspaces.BranchName(space, run.IssueKey, run.IssueTitle))
             .Where(x => x.HasChanges)
             .ToList();
         if (problems.Count == 0)
@@ -880,7 +880,8 @@ sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
     {
         // The terminal's own input and output: the person talks to Claude Code, which asks before anything not allowed.
         var info = Info(apiKey, issueKey, workspace);
-        AddArguments(info, ["--resume", sessionId, .. Common(issueKey, workspace)]);
+        // The person approves what isn't allowed - not their own default mode (e.g. Auto), which would decide for them.
+        AddArguments(info, ["--resume", sessionId, "--permission-mode", "default", .. Common(issueKey, workspace, interactive: true)]);
         using var process = System.Diagnostics.Process.Start(info)!;
         process.WaitForExit();
         return process.ExitCode;
@@ -913,7 +914,7 @@ sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
     }
 
     /// <summary>The Boards MCP server and skill, the project settings only, the allowed and denied tools, the other repositories.</summary>
-    private string[] Common(string issueKey, Workspace workspace)
+    private string[] Common(string issueKey, Workspace workspace, bool interactive = false)
     {
         var mcpConfigPath = Path.Combine(config.WorktreeFolder, $"{issueKey}.mcp.json");
         Directory.CreateDirectory(config.WorktreeFolder);
@@ -924,6 +925,9 @@ sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
             "--mcp-config", mcpConfigPath,
             "--strict-mcp-config",
             "--setting-sources", "project",
+            // The person's browser only in an interactive session they allowed it for (RunnerConfig.Chrome); otherwise
+            // Claude Code would ask (interactive) or could use Claude in Chrome unattended.
+            interactive && config.Chrome ? "--chrome" : "--no-chrome",
             "--allowedTools", "Skill(boards-agent:work-on-issue)", .. AllowedCommands(workspace), .. CodingAgents.BoardsTools.Select(x => $"mcp__boards__{x}"),
             "--disallowedTools", .. DisallowedTools,
             // In checkout mode the other clones aren't under the first one, where Claude Code starts.
@@ -1952,7 +1956,8 @@ static class Workspaces
         var branch = BranchName(space, issueKey, issueTitle);
         foreach (var repo in space.Repos)
         {
-            if (Git.UncommittedFiles(repo.ClonePath) > 0)
+            // Changes on the issue's own branch are the agent's unfinished work, which this run continues.
+            if (Git.CurrentBranch(repo.ClonePath) != branch && Git.UncommittedFiles(repo.ClonePath) > 0)
             {
                 throw new InvalidOperationException($"{repo.Name} ({repo.ClonePath}) has uncommitted changes");
             }
@@ -1961,7 +1966,9 @@ static class Workspaces
         var repos = new List<WorkspaceRepo>();
         foreach (var repo in space.Repos)
         {
-            var previous = Git.CurrentBranch(repo.ClonePath);
+            // Already on the issue's branch (an earlier run of it): nothing to go back to afterwards.
+            var current = Git.CurrentBranch(repo.ClonePath);
+            var previous = current == branch ? null : current;
             Git.SwitchToBranch(repo.ClonePath, repo.BaseRef, branch);
             repos.Add(ToWorkspaceRepo(repo, repo.ClonePath) with { PreviousBranch = previous });
         }
@@ -2063,13 +2070,22 @@ static class Checkouts
     /// One line per clone that isn't ready to be switched: uncommitted changes, or a branch other than the default one
     /// (e.g. the previous issue's, still under review). Empty when every clone is clean and on its default branch.
     /// </summary>
-    public static IReadOnlyList<CheckoutProblem> Problems(SpaceContext space)
+    /// <param name="issueBranch">
+    /// The issue's own branch: a clone already on it is no problem whatever it has - uncommitted changes there are the
+    /// agent's unfinished work on this issue (a run cut off by its turn limit), which the next run continues.
+    /// </param>
+    public static IReadOnlyList<CheckoutProblem> Problems(SpaceContext space, string issueBranch)
     {
         var problems = new List<CheckoutProblem>();
         foreach (var repo in space.Repos)
         {
-            var uncommitted = Git.UncommittedFiles(repo.ClonePath);
             var branch = Git.CurrentBranch(repo.ClonePath);
+            if (branch == issueBranch)
+            {
+                continue;
+            }
+
+            var uncommitted = Git.UncommittedFiles(repo.ClonePath);
             var defaultBranch = DefaultBranch(repo.BaseRef);
             var issues = new List<string>();
             if (uncommitted != 0)
@@ -2987,7 +3003,16 @@ sealed record RunnerConfig
     ];
 
     /// <summary>Claude Code's --max-turns. Codex has no turn limit; the timeout is its only limit.</summary>
-    public int MaxTurns { get; set; } = 50;
+    public int MaxTurns { get; set; } = DefaultMaxTurns;
+
+    /// <summary>
+    /// 150: a task across two repositories (backend and web, with tests) ran out at the old default of 50 (MIN-22). The
+    /// timeout still bounds a run that goes wrong.
+    /// </summary>
+    public const int DefaultMaxTurns = 150;
+
+    /// <summary>The default before 0.4.0-beta.5, written into every config setup saved - read as "the default".</summary>
+    private const int OldDefaultMaxTurns = 50;
 
     /// <summary>Claude Code's --max-budget-usd, if the installed version supports it. Not available for Codex.</summary>
     public decimal? MaxBudgetUsd { get; set; }
@@ -3010,6 +3035,13 @@ sealed record RunnerConfig
     /// - it also opens a pull request with the GitHub CLI. The agent itself never pushes.
     /// </summary>
     public string Publish { get; set; } = PublishModes.Off;
+
+    /// <summary>
+    /// Whether Claude Code may use the person's Chrome (the Claude in Chrome extension) in interactive `lba continue`
+    /// sessions, e.g. to open the app and check a change while they watch. Background runs never do: nobody is there to
+    /// approve browser actions. Asked in setup when the agent is Claude Code; off by default.
+    /// </summary>
+    public bool Chrome { get; set; }
 
     /// <summary>How often Ready runs are polled.</summary>
     public int PollIntervalSeconds { get; set; } = 60;
@@ -3064,6 +3096,7 @@ sealed record RunnerConfig
             ?? throw new InvalidOperationException($"{path} is empty.");
         return config with
         {
+            MaxTurns = config.MaxTurns == OldDefaultMaxTurns ? DefaultMaxTurns : config.MaxTurns,
             Spaces = config.Spaces.ToDictionary(
                 x => x.Key,
                 x => x.Value with { Repo = x.Value.Repo is { Length: > 0 } repo ? Paths.Expand(repo) : null }),
@@ -4104,10 +4137,22 @@ static class Setup
         // 5. What happens to the agent's work: kept local, pushed, or a pull request.
         config = config with { Publish = ChoosePublish(config) };
 
+        // 6. Claude Code only: may it use your Chrome when you continue a session with it?
+        if (codingAgent.Key == CodingAgents.Claude)
+        {
+            Console.WriteLine();
+            config = config with
+            {
+                Chrome = Confirm(
+                    "When you continue an agent's session (lba continue), may Claude Code use your Chrome (the Claude in Chrome extension) to open the app and check its work? You approve each browser action; background runs never use the browser.",
+                    defaultYes: config.Chrome),
+            };
+        }
+
         config.Save(options.ConfigPath);
         Console.WriteLine($"Saved {options.ConfigPath}.");
 
-        // 6. The coding agent's own sign-in.
+        // 7. The coding agent's own sign-in.
         string executable;
         try
         {
