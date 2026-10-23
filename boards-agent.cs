@@ -837,6 +837,20 @@ abstract class AgentProcess : IDisposable
     /// <summary>The agent stopped at its turn limit (Claude Code's error_max_turns), not because it was done or stuck.</summary>
     public virtual bool HitTurnLimit => false;
 
+    /// <summary>
+    /// Called with one line per step the agent takes - a command, an edit, a Boards call - so `lba continue` with an
+    /// instruction shows it working instead of a silent terminal.
+    /// </summary>
+    public Action<string>? OnStep { get; set; }
+
+    protected void Step(string? text)
+    {
+        if (OnStep is { } onStep && text?.Split('\n')[0].Trim() is { Length: > 0 } line)
+        {
+            onStep(line.Length > 120 ? line[..119] + "…" : line);
+        }
+    }
+
     /// <summary>One line of the agent's stdout, already written to the log.</summary>
     protected abstract void OnOutputLine(string line);
 
@@ -1144,6 +1158,11 @@ sealed class ClaudeCodeProcess(System.Diagnostics.Process process, string logPat
             _resultLine = line;
         }
 
+        if (line.Contains("\"tool_use\"", StringComparison.Ordinal))
+        {
+            ReportToolCalls(line);
+        }
+
         // Every stream-json message carries the session id; the first one is enough.
         if (SessionId is null && line.Contains("\"session_id\"", StringComparison.Ordinal))
         {
@@ -1159,6 +1178,56 @@ sealed class ClaudeCodeProcess(System.Diagnostics.Process process, string logPat
             {
             }
         }
+    }
+
+    /// <summary>Each tool call of an assistant message as a step: "Build and run the tests", "Edit IssuesService.cs".</summary>
+    private void ReportToolCalls(string line)
+    {
+        try
+        {
+            using var message = JsonDocument.Parse(line);
+            var root = message.RootElement;
+            if (!root.TryGetProperty("type", out var type)
+                || type.GetString() != "assistant"
+                || !root.TryGetProperty("message", out var body)
+                || !body.TryGetProperty("content", out var content)
+                || content.ValueKind != JsonValueKind.Array)
+            {
+                return;
+            }
+
+            foreach (var block in content.EnumerateArray())
+            {
+                if (block.TryGetProperty("type", out var blockType)
+                    && blockType.GetString() == "tool_use"
+                    && block.TryGetProperty("name", out var name))
+                {
+                    Step(ToolStep(name.GetString() ?? "", block.TryGetProperty("input", out var input) ? input : default));
+                }
+            }
+        }
+        catch (JsonException)
+        {
+        }
+    }
+
+    private static string? ToolStep(string tool, JsonElement input)
+    {
+        string? Text(string property) =>
+            input.ValueKind == JsonValueKind.Object && input.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String
+                ? value.GetString()
+                : null;
+
+        return tool switch
+        {
+            "Bash" => Text("description") ?? Text("command"),
+            "Read" or "Edit" or "Write" or "MultiEdit" or "NotebookEdit" =>
+                (Text("file_path") ?? Text("notebook_path")) is { } path ? $"{tool} {Path.GetFileName(path)}" : tool,
+            "Grep" or "Glob" => $"Search {Text("pattern")}",
+            "TodoWrite" => null,
+            _ when tool.StartsWith("mcp__boards__", StringComparison.Ordinal) => $"Boards: {tool["mcp__boards__".Length..]}",
+            _ => tool,
+        };
     }
 
     private static bool IsResult(string line)
@@ -1342,6 +1411,15 @@ sealed class CodexProcess(System.Diagnostics.Process process, string logPath) : 
                         && itemType.GetString() == "agent_message":
                     _lastMessage = item.TryGetProperty("text", out var messageText) ? messageText.GetString() : _lastMessage;
                     break;
+                case "item.started" when root.TryGetProperty("item", out var started):
+                    Step(CodexStep(started));
+                    break;
+                case "item.completed"
+                    when root.TryGetProperty("item", out var completed)
+                        && completed.TryGetProperty("type", out var completedType)
+                        && completedType.GetString() == "file_change":
+                    Step(CodexStep(completed));
+                    break;
                 case "thread.started":
                     SessionId = root.TryGetProperty("thread_id", out var thread) ? thread.GetString() : null;
                     break;
@@ -1366,6 +1444,34 @@ sealed class CodexProcess(System.Diagnostics.Process process, string logPath) : 
         catch (JsonException)
         {
             // Not an event line; it's in the log anyway.
+        }
+    }
+
+    /// <summary>An item as a step: the command it runs, the files it changed, the Boards tool it calls.</summary>
+    private static string? CodexStep(JsonElement item)
+    {
+        string? Text(JsonElement element, string property) =>
+            element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
+
+        switch (Text(item, "type"))
+        {
+            case "command_execution":
+                // Codex wraps commands in a shell: bash -lc 'dotnet test'.
+                var command = Text(item, "command");
+                return command is not null && command.StartsWith("bash -lc ", StringComparison.Ordinal)
+                    ? command["bash -lc ".Length..].Trim('\'', '"')
+                    : command;
+            case "file_change" when item.TryGetProperty("changes", out var changes) && changes.ValueKind == JsonValueKind.Array:
+                var files = changes.EnumerateArray()
+                    .Select(change => Text(change, "path"))
+                    .OfType<string>()
+                    .Select(Path.GetFileName);
+                return $"Edit {string.Join(", ", files)}";
+            case "mcp_tool_call":
+                var server = Text(item, "server");
+                return server == "boards" ? $"Boards: {Text(item, "tool")}" : $"{server}: {Text(item, "tool")}";
+            default:
+                return null;
         }
     }
 
@@ -1847,6 +1953,7 @@ static class ContinueCommand
             var logPath = Path.Combine(config.WorktreeFolder, $"{key}.continue-{DateTime.UtcNow:yyyyMMddHHmmss}.jsonl");
             Console.WriteLine($"{codingAgent.Name} continues {key} on {workspace.Branch}: \"{instruction}\". Log: {logPath}");
             using var agent = codingAgent.Resume(apiKey, key, workspace, session.SessionId, Prompt(key, instruction, continueRun), logPath);
+            agent.OnStep = step => Console.WriteLine($"  {DateTime.Now:HH:mm:ss}  {step}");
             var finished = await Task.WhenAny(agent.WaitForExitAsync(), Task.Delay(Timeout.Infinite, ct));
             if (finished is not Task { IsCompletedSuccessfully: true } || ct.IsCancellationRequested)
             {
