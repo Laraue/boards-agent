@@ -37,14 +37,14 @@ Setup asks; the `workspace` setting in the config holds the answer.
   - `push`: after a run ends Done, boards-agent pushes the issue's branch in every repository the agent committed to.
   - `pr`: it also opens a pull request with the [GitHub CLI](https://cli.github.com) (`gh`, signed in), or finds the one an earlier run of the issue opened.
   The runner's comment on the issue and the review notification carry the branches and pull requests. The agent itself still can't push: boards-agent does, after the run.
-- **Feedback, right here: `lba continue`.** Opens the agent's session of an issue in your terminal - the same Claude Code or Codex conversation, with everything it knew, in the same repositories and on the issue's branch. Talk to it ("the button is still blue", "add a test"), see the changes and run the app straight away: no status changes in Boards, no waiting.
+- **Feedback, right here: `lba continue`.** Opens the agent's session of an issue in your terminal - the same Claude Code or Codex conversation, with everything it knew, in the same repositories and on the issue's branch. Talk to it ("the button is still blue", "add a test"), see the changes and run the app straight away: no hand-off in Boards, no waiting.
   ```bash
   lba continue                              # the issue of the branch you're on, else your agent's last run
   lba continue BRD-42                       # a given issue
   lba continue BRD-42 make the button red   # one round without you; its answer is printed (quotes optional)
   ```
   Interactive sessions ask you before anything that isn't allowed. With `"chrome": true` (setup asks, Claude Code only), they may also use your Chrome through the Claude in Chrome extension, e.g. to open the app and check the change; background runs never use the browser.
-  When you're done, one summary comment with the new commits goes to the issue (and with `publish` on, the branch is pushed and the pull request updated). In checkout mode, your clones are switched back to the issue's branch first, asking only about uncommitted changes. Only the computer that ran the issue has its session.
+  The session is an agent run in Boards too, so the issue shows **Agent working** while it's open (and is locked, like during any run) - unless the issue already has an open run, which is left alone. When you're done, one summary comment with the new commits goes to the issue (and with `publish` on, the branch is pushed and the pull request updated), the issue moves to Review and the run is finished as Done. Without new commits the run is cancelled, so a look around leaves nothing but its history. If the session is cut off (a crash, a closed terminal), the run stays open: the next `lba continue` of the issue carries on with it, or cancel it in Boards. In checkout mode, your clones are switched back to the issue's branch first, asking only about uncommitted changes. Only the computer that ran the issue has its session.
 - **Feedback from Boards.** **Send back to agent** on an issue under review takes your comment, moves the issue back and hands it off again; the next run continues on the same branch ("continuing ... (N commits so far)") and follows your comments. Handy when you're away from the computer.
 
 ## Safety

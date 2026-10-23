@@ -601,6 +601,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
 /// <summary>Agent run states, as the MCP tools name them.</summary>
 static class AgentRunStates
 {
+    public const string Ready = "Ready";
     public const string Working = "Working";
     public const string Done = "Done";
     public const string Failed = "Failed";
@@ -654,9 +655,10 @@ interface ICodingAgent
 
     /// <summary>
     /// `lba continue KEY`: the agent's earlier session, interactive in this terminal - the person talks to it and approves
-    /// what it asks. Returns its exit code.
+    /// what it asks. <paramref name="context"/>, when given, tells the agent about the session (e.g. its agent run)
+    /// without being a message of the person's. Returns its exit code.
     /// </summary>
-    int ResumeInteractive(string apiKey, string issueKey, Workspace workspace, string sessionId);
+    int ResumeInteractive(string apiKey, string issueKey, Workspace workspace, string sessionId, string? context);
 }
 
 static class CodingAgents
@@ -972,12 +974,17 @@ sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
         return new ClaudeCodeProcess(AgentProcess.Launch(info), logPath);
     }
 
-    public int ResumeInteractive(string apiKey, string issueKey, Workspace workspace, string sessionId)
+    public int ResumeInteractive(string apiKey, string issueKey, Workspace workspace, string sessionId, string? context)
     {
         // The terminal's own input and output: the person talks to Claude Code, which asks before anything not allowed.
         var info = Info(apiKey, issueKey, workspace);
         // The person approves what isn't allowed - not their own default mode (e.g. Auto), which would decide for them.
         AddArguments(info, ["--resume", sessionId, "--permission-mode", "default", .. Common(issueKey, workspace, interactive: true)]);
+        if (context is not null)
+        {
+            AddArguments(info, ["--append-system-prompt", context]);
+        }
+
         using var process = System.Diagnostics.Process.Start(info)!;
         process.WaitForExit();
         return process.ExitCode;
@@ -1225,8 +1232,10 @@ sealed class CodexAgent(RunnerConfig config) : ICodingAgent
         return new CodexProcess(AgentProcess.Launch(info), logPath);
     }
 
-    public int ResumeInteractive(string apiKey, string issueKey, Workspace workspace, string sessionId)
+    public int ResumeInteractive(string apiKey, string issueKey, Workspace workspace, string sessionId, string? context)
     {
+        // Codex can't take extra instructions without sending them as the person's first message, so the context isn't
+        // passed: the runner ends the run itself when the session ends.
         var info = Info(apiKey, workspace);
         AddArguments(info, [.. Options(workspace), "resume", sessionId]);
         using var process = System.Diagnostics.Process.Start(info)!;
@@ -1724,7 +1733,11 @@ static class RunsInProgress
 /// The agent session of an issue's last run on this machine, for `lba continue` - only this machine has it. Kept in
 /// sessions/KEY.json next to the config.
 /// </summary>
-sealed record AgentSession(string IssueKey, string IssueTitle, string IssueUrl, string Agent, string SessionId, RunInProgressWorkspace Workspace);
+/// <param name="ContinueRunId">
+/// The run the last `lba continue` started (BRD-320). Still Working next time means that session was cut off (a crash,
+/// a closed terminal), so the next `lba continue` carries on with it instead of starting another.
+/// </param>
+sealed record AgentSession(string IssueKey, string IssueTitle, string IssueUrl, string Agent, string SessionId, RunInProgressWorkspace Workspace, long? ContinueRunId = null);
 
 static class AgentSessions
 {
@@ -1809,16 +1822,36 @@ static class ContinueCommand
             return 1;
         }
 
+        // The session is an agent run in Boards (BRD-320), so the issue shows the agent working on it, then done.
+        BoardsClient? boards = null;
+        AgentRunSummary? continueRun = null;
+        try
+        {
+            boards = await BoardsClient.ConnectAsync(config.McpUrl, apiKey, ct);
+            continueRun = await OpenRun(boards, runFile, session, ct);
+            if (continueRun is not null)
+            {
+                session = session with { ContinueRunId = continueRun.Id };
+                AgentSessions.Save(runFile, session);
+            }
+        }
+        catch (Exception e) when (!ct.IsCancellationRequested)
+        {
+            Console.WriteLine($"Couldn't start an agent run in Boards ({e.Message}) - continuing without one.");
+        }
+
         var startHeads = workspace.Repos.ToDictionary(x => x.Path, x => Git.ResolveCommit(x.Path, "HEAD"));
+        var stopped = false;
         if (options.Instruction is { } instruction)
         {
             var logPath = Path.Combine(config.WorktreeFolder, $"{key}.continue-{DateTime.UtcNow:yyyyMMddHHmmss}.jsonl");
             Console.WriteLine($"{codingAgent.Name} continues {key} on {workspace.Branch}: \"{instruction}\". Log: {logPath}");
-            using var agent = codingAgent.Resume(apiKey, key, workspace, session.SessionId, Prompt(key, instruction), logPath);
+            using var agent = codingAgent.Resume(apiKey, key, workspace, session.SessionId, Prompt(key, instruction, continueRun), logPath);
             var finished = await Task.WhenAny(agent.WaitForExitAsync(), Task.Delay(Timeout.Infinite, ct));
             if (finished is not Task { IsCompletedSuccessfully: true } || ct.IsCancellationRequested)
             {
                 agent.Kill();
+                stopped = true;
                 Console.WriteLine("Stopped.");
             }
 
@@ -1833,25 +1866,65 @@ static class ContinueCommand
             Console.WriteLine(agent.Summary());
             if (agent.SessionId is { } sessionId && sessionId != session.SessionId)
             {
-                AgentSessions.Save(runFile, session with { SessionId = sessionId });
+                session = session with { SessionId = sessionId };
+                AgentSessions.Save(runFile, session);
             }
         }
         else
         {
             Console.WriteLine($"Opening {codingAgent.Name}'s session of {key} on {workspace.Branch}. Exit it when you're done; laraue-boards-agent then posts a summary to the issue.");
-            codingAgent.ResumeInteractive(apiKey, key, workspace, session.SessionId);
+            codingAgent.ResumeInteractive(apiKey, key, workspace, session.SessionId, continueRun is null ? null : RunContext(key, continueRun));
         }
 
         var changed = workspace.Repos
-            .Select(repo => new { repo, Commits = startHeads[repo.Path] is { } head ? Git.CommitsSince(repo.Path, head) : -1 })
+            .Select(repo => new RepoCommits(repo, startHeads[repo.Path] is { } head ? Git.CommitsSince(repo.Path, head) : -1))
             .Where(x => x.Commits > 0)
             .ToList();
 
         // As after a run: repositories the agent never committed to go back where they were, their empty branch deleted.
         Workspaces.Finish(workspace);
+
+        try
+        {
+            return await Report(config, options, codingAgent, apiKey, session, workspace, changed, boards, continueRun, stopped);
+        }
+        finally
+        {
+            if (boards is not null)
+            {
+                await boards.DisposeAsync();
+            }
+        }
+    }
+
+    private sealed record RepoCommits(WorkspaceRepo Repo, int Commits);
+
+    /// <summary>
+    /// After the session: the summary comment and publishing when there are new commits, and the end of the session's
+    /// run. Ctrl+C doesn't stop it: in an interactive session it was meant for the agent, and a run left Working would
+    /// keep the issue locked.
+    /// </summary>
+    private static async Task<int> Report(
+        RunnerConfig config,
+        RunnerArgs options,
+        ICodingAgent codingAgent,
+        string apiKey,
+        AgentSession session,
+        Workspace workspace,
+        IReadOnlyList<RepoCommits> changed,
+        BoardsClient? boards,
+        AgentRunSummary? continueRun,
+        bool stopped)
+    {
+        var key = session.IssueKey;
         if (changed.Count == 0)
         {
             Console.WriteLine("No new commits, so nothing is posted to Boards.");
+            if (continueRun is not null && boards is not null)
+            {
+                await EndRun(boards, key, continueRun, done: false);
+            }
+
             return 0;
         }
 
@@ -1860,17 +1933,31 @@ static class ContinueCommand
         var comment = $"_laraue-boards-agent: continued with {codingAgent.Name} on {Environment.MachineName}"
             + (options.Instruction is { } asked ? $" (\"{Shorten(asked)}\")" : "")
             + "_\n\nNew commits:\n"
-            + string.Join("\n", changed.Select(x => $"- {x.repo.Name}: `{workspace.Branch}`, {x.Commits} commit{(x.Commits == 1 ? "" : "s")}"))
+            + string.Join("\n", changed.Select(x => $"- {x.Repo.Name}: `{workspace.Branch}`, {x.Commits} commit{(x.Commits == 1 ? "" : "s")}"))
             + (published.Count == 0 ? "" : "\n\nPublished:\n" + string.Join("\n", published.Select(x => $"- {x.Line}")));
         try
         {
-            await using var boards = await BoardsClient.ConnectAsync(config.McpUrl, apiKey, ct);
-            await boards.CreateComment(key, comment, ct);
+            if (boards is null)
+            {
+                await using var connected = await BoardsClient.ConnectAsync(config.McpUrl, apiKey, CancellationToken.None);
+                await connected.CreateComment(key, comment, CancellationToken.None);
+            }
+            else
+            {
+                await boards.CreateComment(key, comment, CancellationToken.None);
+            }
+
             Console.WriteLine($"Posted a summary to {key}: {changed.Sum(x => x.Commits)} new commit(s).");
         }
-        catch (Exception e) when (!ct.IsCancellationRequested)
+        catch (Exception e)
         {
             Console.WriteLine($"Couldn't post the summary to Boards: {e.Message}");
+        }
+
+        // A stopped round may be half done: its commits stay on the branch, but the run isn't reported as done.
+        if (continueRun is not null && boards is not null)
+        {
+            await EndRun(boards, key, continueRun, done: !stopped);
         }
 
         var pullRequest = published.Select(x => x.PullRequestUrl).OfType<string>().FirstOrDefault();
@@ -1945,13 +2032,103 @@ static class ContinueCommand
         return true;
     }
 
-    private static string Prompt(string issueKey, string instruction)
+    /// <summary>
+    /// The session's run: a new Working one (start_agent_run), or the one an earlier `lba continue` of this issue
+    /// started and didn't end (it was cut off). Null when the issue has another open run - a hand-off, or a runner on
+    /// it - which this session leaves alone.
+    /// </summary>
+    private static async Task<AgentRunSummary?> OpenRun(BoardsClient boards, string runFile, AgentSession session, CancellationToken ct)
     {
+        var key = session.IssueKey;
+        var issue = await boards.GetIssue(key, ct);
+        if (issue.LatestAgentRun is { State: AgentRunStates.Ready or AgentRunStates.Working } open)
+        {
+            if (open.Id == session.ContinueRunId && open.State == AgentRunStates.Working)
+            {
+                Console.WriteLine($"Carrying on with agent run {open.Id}, which an earlier `lba continue` of {key} left open.");
+                return open;
+            }
+
+            Console.WriteLine($"{key} already has an open agent run ({open.Id}, {open.State}), so this session doesn't start one.");
+            return null;
+        }
+
+        var run = await boards.StartAgentRun(key, ct);
+        Console.WriteLine($"Started agent run {run.Id}: {key} shows the agent working until this session ends.");
+        return run;
+    }
+
+    /// <summary>
+    /// Ends the session's run: with new commits (<paramref name="done"/>) the issue goes to Review, if it wasn't there or
+    /// further yet, and the run is finished Done; without, the run is cancelled, so a look around leaves nothing but its
+    /// history. A run the agent or a person already ended is left as it is. Not cancellable.
+    /// </summary>
+    private static async Task EndRun(BoardsClient boards, string key, AgentRunSummary run, bool done)
+    {
+        try
+        {
+            var issue = await boards.GetIssue(key, CancellationToken.None);
+            var state = issue.LatestAgentRun?.Id == run.Id ? issue.LatestAgentRun.State : null;
+            if (!done)
+            {
+                if (state == AgentRunStates.Working && await boards.CancelAgentRun(run.Id, CancellationToken.None))
+                {
+                    Console.WriteLine($"Cancelled agent run {run.Id}: nothing to review.");
+                }
+
+                return;
+            }
+
+            if (state is not (AgentRunStates.Working or AgentRunStates.Done))
+            {
+                Console.WriteLine($"Agent run {run.Id} is {state ?? "no longer the issue's latest"}, so it's left as it is.");
+                return;
+            }
+
+            if (issue.StatusCategoryId is StatusCategories.Created or StatusCategories.InProgress
+                && (await boards.ListStatuses(IssueKeys.SpaceKey(key), CancellationToken.None))
+                    .FirstOrDefault(x => x.EpicId == issue.EpicId)?.Statuses
+                    .FirstOrDefault(x => x.CategoryId == StatusCategories.Review) is { } review)
+            {
+                await boards.EditIssueStatus(key, review.Id, null, CancellationToken.None);
+                Console.WriteLine($"Moved {key} to {review.Name}.");
+            }
+
+            if (state == AgentRunStates.Working && await boards.FinishAgentRun(run.Id, AgentRunStates.Done, null, CancellationToken.None))
+            {
+                Console.WriteLine($"Finished agent run {run.Id} as Done.");
+            }
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"Couldn't end agent run {run.Id} in Boards ({e.Message}) - `lba continue {key}` carries on with it, or cancel it in Boards.");
+        }
+    }
+
+    /// <summary>What the agent is told about the session's run, so its finish_agent_run - if any - is this run's.</summary>
+    private static string RunContext(string issueKey, AgentRunSummary run)
+    {
+        return $"""
+            This session continues your work on {issueKey} as agent run {run.Id} (agent run id: {run.Id}) - any earlier run id
+            of the issue is over. Commit your changes on the branch as before. When the session ends, laraue-boards-agent
+            posts the summary, moves the issue to review and finishes run {run.Id} (Done with new commits, cancelled without),
+            so don't change the issue's status or finish the run yourself - unless you give up: then
+            finish_agent_run({run.Id}, Failed, reason).
+            """;
+    }
+
+    private static string Prompt(string issueKey, string instruction, AgentRunSummary? run)
+    {
+        var context = run is null
+            ? $"""
+              This continues your work on {issueKey} after its run, outside Boards: commit your changes on the branch as before.
+              Don't change the issue's status or finish an agent run in Boards - laraue-boards-agent posts the summary.
+              """
+            : RunContext(issueKey, run);
         return $"""
             {instruction}
 
-            (This continues your work on {issueKey} after its run, outside Boards: commit your changes on the branch as before.
-            Don't change the issue's status or finish an agent run in Boards - laraue-boards-agent posts the summary.)
+            ({context})
             """;
     }
 
@@ -3332,6 +3509,21 @@ sealed class BoardsClient(string url, string apiKey, McpClient connected) : IAsy
         return Call("claim_agent_run", new Dictionary<string, object?> { ["runId"] = runId }, RunnerJson.Default.Boolean, ct);
     }
 
+    /// <summary>
+    /// A new run of the issue that is already Working, claimed by this key - for `lba continue`. Throws (400) when the
+    /// issue already has an open run, (403) when the issue isn't the user's.
+    /// </summary>
+    public Task<AgentRunSummary> StartAgentRun(string issueKey, CancellationToken ct)
+    {
+        return Call("start_agent_run", new Dictionary<string, object?> { ["issueKey"] = issueKey }, RunnerJson.Default.AgentRunSummary, ct);
+    }
+
+    /// <summary>False when the run had already ended.</summary>
+    public Task<bool> CancelAgentRun(long runId, CancellationToken ct)
+    {
+        return Call("cancel_agent_run", new Dictionary<string, object?> { ["runId"] = runId }, RunnerJson.Default.Boolean, ct);
+    }
+
     /// <summary>False when the run isn't Working anymore (cancelled meanwhile).</summary>
     public Task<bool> FinishAgentRun(long runId, string state, string? reason, CancellationToken ct)
     {
@@ -3488,6 +3680,7 @@ sealed record IssueDetail(string Key, string Title, string Status, long? StatusI
 [JsonSerializable(typeof(AgentSignInPoll))]
 [JsonSerializable(typeof(MeInfo))]
 [JsonSerializable(typeof(AgentRunListPage))]
+[JsonSerializable(typeof(AgentRunSummary))]
 [JsonSerializable(typeof(IReadOnlyList<EpicStatusSummary>))]
 [JsonSerializable(typeof(IssueDetail))]
 [JsonSerializable(typeof(bool))]
