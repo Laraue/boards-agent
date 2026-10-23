@@ -92,6 +92,15 @@ Post a comment saying why and what a person needs to do or decide. Then call
 badge), e.g. `Blocked by BRD-12 (In Progress)` or `Needs a decision on the API shape`. Leave the issue in its
 status: the assignee moves it back when they hand it off again.
 
+## Sessions continued with `lba continue`
+
+After a run, the assignee may continue your session with `lba continue`, talking to you or giving one instruction.
+Such a session is a run of its own: laraue-boards-agent tells you its id ("continues your work on BRD-12 as agent
+run 15"). From then on that's the run id - the run you worked on before is over, so never finish it. The runner ends
+this run when the session ends (Done with new commits, after moving the issue to Review; cancelled without), so don't
+change the issue's status or call `finish_agent_run` yourself - unless you give up: then
+`finish_agent_run(<that id>, "Failed", reason)`. Take instructions from the person in the session as from the assignee.
+
 ## Comments
 
 Keep them short and in markdown. Write for the assignee, who will read them on the issue page later. Don't
