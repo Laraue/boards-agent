@@ -1877,7 +1877,7 @@ static class ContinueCommand
         }
 
         var changed = workspace.Repos
-            .Select(repo => new RepoCommits(repo, startHeads[repo.Path] is { } head ? Git.CommitsSince(repo.Path, head) : -1))
+            .Select(repo => new RepoCommits(repo, startHeads[repo.Path] is { } head ? Git.CommitsSince(repo.Path, head, workspace.Branch) : -1))
             .Where(x => x.Commits > 0)
             .ToList();
 
@@ -2260,7 +2260,7 @@ static class Workspaces
         {
             CommitsSoFar = workspace.Repos
                 .Where(repo => repo.BaseCommit is not null)
-                .Sum(repo => Math.Max(0, Git.CommitsSince(repo.Path, repo.BaseCommit!))),
+                .Sum(repo => Math.Max(0, Git.CommitsSince(repo.Path, repo.BaseCommit!, workspace.Branch))),
         };
     }
 
@@ -2279,7 +2279,7 @@ static class Workspaces
         var changed = new List<string>();
         foreach (var repo in workspace.Repos)
         {
-            var commits = repo.BaseCommit is null ? -1 : Git.CommitsSince(repo.Path, repo.BaseCommit);
+            var commits = repo.BaseCommit is null ? -1 : Git.CommitsSince(repo.Path, repo.BaseCommit, workspace.Branch);
             var uncommitted = Git.UncommittedFiles(repo.Path);
             var left = uncommitted == 0 ? "" : $", {uncommitted} uncommitted file{(uncommitted == 1 ? "" : "s")} left";
             if (commits == 0 && uncommitted == 0 && repo.PreviousBranch is { } previous)
@@ -2308,7 +2308,7 @@ static class Workspaces
         var changed = new List<string>();
         foreach (var repo in workspace.Repos)
         {
-            var commits = repo.BaseCommit is null ? -1 : Git.CommitsSince(repo.Path, repo.BaseCommit);
+            var commits = repo.BaseCommit is null ? -1 : Git.CommitsSince(repo.Path, repo.BaseCommit, workspace.Branch);
             if (commits > 0)
             {
                 changed.Add($"{repo.Name}: `{workspace.Branch}`, {commits} commit{(commits == 1 ? "" : "s")}");
@@ -2490,7 +2490,7 @@ static class Publisher
         var published = new List<PublishedRepo>();
         foreach (var repo in workspace.Repos)
         {
-            if (repo.BaseCommit is null || Git.CommitsSince(repo.Path, repo.BaseCommit) <= 0)
+            if (repo.BaseCommit is null || Git.CommitsSince(repo.Path, repo.BaseCommit, workspace.Branch) <= 0)
             {
                 continue;
             }
@@ -2909,10 +2909,14 @@ static class Git
         return result.ExitCode == 0 && result.Output.Trim() is { Length: > 0 } commit ? commit : null;
     }
 
-    /// <summary>How many commits the worktree's branch has beyond <paramref name="baseCommit"/>; -1 when that can't be told.</summary>
-    public static int CommitsSince(string worktree, string baseCommit)
+    /// <summary>
+    /// How many commits <paramref name="branch"/> has beyond <paramref name="baseCommit"/>; -1 when that can't be told,
+    /// e.g. the branch was deleted. Not HEAD: in checkout mode, <see cref="Workspaces.Finish"/> switches a clone the agent
+    /// didn't commit to back to its previous branch, whose commits aren't the agent's.
+    /// </summary>
+    public static int CommitsSince(string repo, string baseCommit, string branch)
     {
-        var result = Run(worktree, ["rev-list", "--count", $"{baseCommit}..HEAD"], throwOnError: false);
+        var result = Run(repo, ["rev-list", "--count", $"{baseCommit}..refs/heads/{branch}"], throwOnError: false);
         return result.ExitCode == 0 && int.TryParse(result.Output.Trim(), out var count) ? count : -1;
     }
 
