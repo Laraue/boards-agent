@@ -881,7 +881,7 @@ sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
         // The terminal's own input and output: the person talks to Claude Code, which asks before anything not allowed.
         var info = Info(apiKey, issueKey, workspace);
         // The person approves what isn't allowed - not their own default mode (e.g. Auto), which would decide for them.
-        AddArguments(info, ["--resume", sessionId, "--permission-mode", "default", .. Common(issueKey, workspace)]);
+        AddArguments(info, ["--resume", sessionId, "--permission-mode", "default", .. Common(issueKey, workspace, interactive: true)]);
         using var process = System.Diagnostics.Process.Start(info)!;
         process.WaitForExit();
         return process.ExitCode;
@@ -914,7 +914,7 @@ sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
     }
 
     /// <summary>The Boards MCP server and skill, the project settings only, the allowed and denied tools, the other repositories.</summary>
-    private string[] Common(string issueKey, Workspace workspace)
+    private string[] Common(string issueKey, Workspace workspace, bool interactive = false)
     {
         var mcpConfigPath = Path.Combine(config.WorktreeFolder, $"{issueKey}.mcp.json");
         Directory.CreateDirectory(config.WorktreeFolder);
@@ -925,8 +925,9 @@ sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
             "--mcp-config", mcpConfigPath,
             "--strict-mcp-config",
             "--setting-sources", "project",
-            // Not the person's browser: Claude Code would otherwise ask (interactive) or could use Claude in Chrome.
-            "--no-chrome",
+            // The person's browser only in an interactive session they allowed it for (RunnerConfig.Chrome); otherwise
+            // Claude Code would ask (interactive) or could use Claude in Chrome unattended.
+            interactive && config.Chrome ? "--chrome" : "--no-chrome",
             "--allowedTools", "Skill(boards-agent:work-on-issue)", .. AllowedCommands(workspace), .. CodingAgents.BoardsTools.Select(x => $"mcp__boards__{x}"),
             "--disallowedTools", .. DisallowedTools,
             // In checkout mode the other clones aren't under the first one, where Claude Code starts.
@@ -3035,6 +3036,13 @@ sealed record RunnerConfig
     /// </summary>
     public string Publish { get; set; } = PublishModes.Off;
 
+    /// <summary>
+    /// Whether Claude Code may use the person's Chrome (the Claude in Chrome extension) in interactive `lba continue`
+    /// sessions, e.g. to open the app and check a change while they watch. Background runs never do: nobody is there to
+    /// approve browser actions. Asked in setup when the agent is Claude Code; off by default.
+    /// </summary>
+    public bool Chrome { get; set; }
+
     /// <summary>How often Ready runs are polled.</summary>
     public int PollIntervalSeconds { get; set; } = 60;
 
@@ -4129,10 +4137,22 @@ static class Setup
         // 5. What happens to the agent's work: kept local, pushed, or a pull request.
         config = config with { Publish = ChoosePublish(config) };
 
+        // 6. Claude Code only: may it use your Chrome when you continue a session with it?
+        if (codingAgent.Key == CodingAgents.Claude)
+        {
+            Console.WriteLine();
+            config = config with
+            {
+                Chrome = Confirm(
+                    "When you continue an agent's session (lba continue), may Claude Code use your Chrome (the Claude in Chrome extension) to open the app and check its work? You approve each browser action; background runs never use the browser.",
+                    defaultYes: config.Chrome),
+            };
+        }
+
         config.Save(options.ConfigPath);
         Console.WriteLine($"Saved {options.ConfigPath}.");
 
-        // 6. The coding agent's own sign-in.
+        // 7. The coding agent's own sign-in.
         string executable;
         try
         {

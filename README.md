@@ -43,6 +43,7 @@ Setup asks; the `workspace` setting in the config holds the answer.
   lba continue BRD-42                       # a given issue
   lba continue BRD-42 make the button red   # one round without you; its answer is printed (quotes optional)
   ```
+  Interactive sessions ask you before anything that isn't allowed. With `"chrome": true` (setup asks, Claude Code only), they may also use your Chrome through the Claude in Chrome extension, e.g. to open the app and check the change; background runs never use the browser.
   When you're done, one summary comment with the new commits goes to the issue (and with `publish` on, the branch is pushed and the pull request updated). In checkout mode, your clones are switched back to the issue's branch first, asking only about uncommitted changes. Only the computer that ran the issue has its session.
 - **Feedback from Boards.** **Send back to agent** on an issue under review takes your comment, moves the issue back and hands it off again; the next run continues on the same branch ("continuing ... (N commits so far)") and follows your comments. Handy when you're away from the computer.
 

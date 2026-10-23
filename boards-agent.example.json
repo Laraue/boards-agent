@@ -24,6 +24,8 @@
   "publish": "off",
   // System notifications (as laraue-boards-agent) when a run starts, is ready for review, fails or is cancelled.
   "notifications": true,
+  // Claude Code only: let interactive `lba continue` sessions use your Chrome (Claude in Chrome); runs never do.
+  "chrome": false,
   // The coding agent: "claude" (Claude Code) or "codex" (OpenAI Codex). Setup asks when both are installed.
   "agent": "claude",
   // "claude" = the one on PATH, or else the newest one bundled with the Claude desktop app.
