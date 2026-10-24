@@ -1931,9 +1931,11 @@ static class ContinueCommand
         // The session is an agent run in Boards (BRD-320), so the issue shows the agent working on it, then done.
         BoardsClient? boards = null;
         AgentRunSummary? continueRun = null;
+        int? commentsBefore = null;
         try
         {
             boards = await BoardsClient.ConnectAsync(config.McpUrl, apiKey, ct);
+            commentsBefore = (await boards.GetIssue(key, ct)).CommentCount;
             continueRun = await OpenRun(boards, runFile, session, ct);
             if (continueRun is not null)
             {
@@ -1993,7 +1995,10 @@ static class ContinueCommand
 
         try
         {
-            return await Report(config, options, codingAgent, apiKey, session, workspace, changed, boards, continueRun, stopped);
+            var artifacts = boards is not null && commentsBefore is { } before
+                ? await Artifacts(boards, key, before)
+                : [];
+            return await Report(config, options, codingAgent, apiKey, session, workspace, changed, artifacts, boards, continueRun, stopped);
         }
         finally
         {
@@ -2007,9 +2012,32 @@ static class ContinueCommand
     private sealed record RepoCommits(WorkspaceRepo Repo, int Commits);
 
     /// <summary>
-    /// After the session: the summary comment and publishing when there are new commits, and the end of the session's
-    /// run. Ctrl+C doesn't stop it: in an interactive session it was meant for the agent, and a run left Working would
-    /// keep the issue locked.
+    /// The files the agent attached to the issue during the session (BRD-318): the attachments of comments after the
+    /// first <paramref name="commentsBefore"/> written through an API key - the agent's, since the session's key is the
+    /// person's own. Empty when they can't be read: the summary then goes by commits alone.
+    /// </summary>
+    private static async Task<IReadOnlyList<string>> Artifacts(BoardsClient boards, string key, int commentsBefore)
+    {
+        try
+        {
+            var comments = await boards.ListIssueCommentsFrom(key, commentsBefore, CancellationToken.None);
+            return comments
+                .Where(x => x.CanManage && x.ApiKeyName is not null)
+                .SelectMany(x => x.Attachments)
+                .Select(x => x.FileName ?? x.Id.ToString())
+                .ToList();
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine($"Couldn't read the agent's comments on {key} ({e.Message}) - only new commits count.");
+            return [];
+        }
+    }
+
+    /// <summary>
+    /// After the session: the summary comment when there are new commits or artifacts, publishing when there are new
+    /// commits, and the end of the session's run. Ctrl+C doesn't stop it: in an interactive session it was meant for the
+    /// agent, and a run left Working would keep the issue locked.
     /// </summary>
     private static async Task<int> Report(
         RunnerConfig config,
@@ -2019,14 +2047,15 @@ static class ContinueCommand
         AgentSession session,
         Workspace workspace,
         IReadOnlyList<RepoCommits> changed,
+        IReadOnlyList<string> artifacts,
         BoardsClient? boards,
         AgentRunSummary? continueRun,
         bool stopped)
     {
         var key = session.IssueKey;
-        if (changed.Count == 0)
+        if (changed.Count == 0 && artifacts.Count == 0)
         {
-            Console.WriteLine("No new commits, so nothing is posted to Boards.");
+            Console.WriteLine("No new commits or artifacts, so nothing is posted to Boards.");
             if (continueRun is not null && boards is not null)
             {
                 await EndRun(boards, key, continueRun, done: false);
@@ -2036,11 +2065,15 @@ static class ContinueCommand
         }
 
         var run = new AgentRunSummary(0, key, session.IssueTitle, session.IssueUrl, AgentRunStates.Done, DateTime.UtcNow, "", null, null, null, null, false);
-        var published = Publisher.Publish(config, run, workspace);
+        // Only new commits are pushed: a round that only produced an artifact leaves the branch as it was.
+        var published = changed.Count == 0 ? [] : Publisher.Publish(config, run, workspace);
         var comment = $"_laraue-boards-agent: continued with {codingAgent.Name} on {Environment.MachineName}"
             + (options.Instruction is { } asked ? $" (\"{Shorten(asked)}\")" : "")
-            + "_\n\nNew commits:\n"
-            + string.Join("\n", changed.Select(x => $"- {x.Repo.Name}: `{workspace.Branch}`, {x.Commits} commit{(x.Commits == 1 ? "" : "s")}"))
+            + "_"
+            + (changed.Count == 0
+                ? ""
+                : "\n\nNew commits:\n" + string.Join("\n", changed.Select(x => $"- {x.Repo.Name}: `{workspace.Branch}`, {x.Commits} commit{(x.Commits == 1 ? "" : "s")}")))
+            + (artifacts.Count == 0 ? "" : "\n\nArtifacts, attached to the agent's comments above:\n" + string.Join("\n", artifacts.Select(x => $"- `{x}`")))
             + (published.Count == 0 ? "" : "\n\nPublished:\n" + string.Join("\n", published.Select(x => $"- {x.Line}")));
         try
         {
@@ -2054,7 +2087,7 @@ static class ContinueCommand
                 await boards.CreateComment(key, comment, CancellationToken.None);
             }
 
-            Console.WriteLine($"Posted a summary to {key}: {changed.Sum(x => x.Commits)} new commit(s).");
+            Console.WriteLine($"Posted a summary to {key}: {changed.Sum(x => x.Commits)} new commit(s), {artifacts.Count} artifact(s).");
         }
         catch (Exception e)
         {
@@ -2166,7 +2199,7 @@ static class ContinueCommand
     }
 
     /// <summary>
-    /// Ends the session's run: with new commits (<paramref name="done"/>) the issue goes to Review, if it wasn't there or
+    /// Ends the session's run: with new commits or artifacts (<paramref name="done"/>) the issue goes to Review, if it wasn't there or
     /// further yet, and the run is finished Done; without, the run is cancelled, so a look around leaves nothing but its
     /// history. A run the agent or a person already ended is left as it is. Not cancellable.
     /// </summary>
@@ -2218,11 +2251,16 @@ static class ContinueCommand
         return $"""
             This session continues your work on {issueKey} as agent run {run.Id} (agent run id: {run.Id}) - any earlier run id
             of the issue is over. Commit your changes on the branch as before. When the session ends, laraue-boards-agent
-            posts the summary, moves the issue to review and finishes run {run.Id} (Done with new commits, cancelled without),
-            so don't change the issue's status or finish the run yourself - unless you give up: then
-            finish_agent_run({run.Id}, Failed, reason).
+            posts the summary, moves the issue to review and finishes run {run.Id} (Done with new commits or artifacts,
+            cancelled without), so don't change the issue's status or finish the run yourself - unless you give up: then
+            finish_agent_run({run.Id}, Failed, reason). {ArtifactsContext}
             """;
     }
+
+    /// <summary>The summary lists only commits, so an artifact of the session is the agent's to attach (BRD-318).</summary>
+    private const string ArtifactsContext =
+        "Attach any artifact you're asked to produce or print (a config, a dashboard JSON, a report) to the issue yourself, "
+        + "as the work-on-issue skill's \"Artifacts\" says: create_comment with files.";
 
     private static string Prompt(string issueKey, string instruction, AgentRunSummary? run)
     {
@@ -2230,6 +2268,7 @@ static class ContinueCommand
             ? $"""
               This continues your work on {issueKey} after its run, outside Boards: commit your changes on the branch as before.
               Don't change the issue's status or finish an agent run in Boards - laraue-boards-agent posts the summary.
+              {ArtifactsContext}
               """
             : RunContext(issueKey, run);
         return $"""
@@ -3668,6 +3707,25 @@ sealed class BoardsClient(string url, string apiKey, McpClient connected) : IAsy
         return CallVoid("create_comment", new Dictionary<string, object?> { ["issueKey"] = issueKey, ["text"] = text }, ct);
     }
 
+    /// <summary>The issue's comments after the first <paramref name="skip"/>, oldest first.</summary>
+    public async Task<IReadOnlyList<IssueComment>> ListIssueCommentsFrom(string issueKey, int skip, CancellationToken ct)
+    {
+        var result = new List<IssueComment>();
+        for (var page = skip / PageSize; ; page++)
+        {
+            var comments = await Call(
+                "list_issue_comments",
+                new Dictionary<string, object?> { ["issueKey"] = issueKey, ["page"] = page, ["count"] = PageSize },
+                RunnerJson.Default.IssueCommentPage,
+                ct);
+            result.AddRange(comments.Comments.Skip(page == skip / PageSize ? skip % PageSize : 0));
+            if (!comments.HasNextPage)
+            {
+                return result;
+            }
+        }
+    }
+
     private async Task<T> Call<T>(string tool, IReadOnlyDictionary<string, object?> arguments, JsonTypeInfo<T> result, CancellationToken ct)
     {
         var text = await CallVoid(tool, arguments, ct);
@@ -3774,7 +3832,14 @@ sealed record ClaudeAuthStatus(bool LoggedIn);
 
 sealed record EpicStatusSummary(long EpicId, string EpicName, IReadOnlyList<StatusSummary> Statuses);
 
-sealed record IssueDetail(string Key, string Title, string Status, long? StatusId, long? EpicId, int StatusCategoryId, AgentRunSummary? LatestAgentRun);
+sealed record IssueDetail(string Key, string Title, string Status, long? StatusId, long? EpicId, int StatusCategoryId, int CommentCount, AgentRunSummary? LatestAgentRun);
+
+sealed record IssueCommentPage(IReadOnlyList<IssueComment> Comments, long Page, bool HasNextPage);
+
+/// <summary>A comment, as far as the runner reads it: whose it is and its attachments.</summary>
+sealed record IssueComment(long Id, string? ApiKeyName, bool CanManage, IReadOnlyList<CommentAttachment> Attachments);
+
+sealed record CommentAttachment(Guid Id, string? FileName);
 
 /// <summary>Source-generated JSON for everything the runner reads, so a trimmed build keeps working.</summary>
 [JsonSourceGenerationOptions(
@@ -3794,6 +3859,7 @@ sealed record IssueDetail(string Key, string Title, string Status, long? StatusI
 [JsonSerializable(typeof(AgentRunSummary))]
 [JsonSerializable(typeof(IReadOnlyList<EpicStatusSummary>))]
 [JsonSerializable(typeof(IssueDetail))]
+[JsonSerializable(typeof(IssueCommentPage))]
 [JsonSerializable(typeof(bool))]
 [JsonSerializable(typeof(RunInProgress))]
 [JsonSerializable(typeof(AgentSession))]
