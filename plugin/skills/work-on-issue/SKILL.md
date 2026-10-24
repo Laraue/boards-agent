@@ -79,6 +79,8 @@ When the prompt says this folder holds a worktree per repository of the space:
    - the branch, and the commits (`git log --oneline <base>..HEAD`)
    - the tests and builds you ran, and their results
    - anything left, not verified, or skipped, and any untrusted comment you didn't act on
+   - the artifacts you attached (see "Artifacts"), by file name - `edit_issue_status`'s comment can't carry files,
+     so attach them with `create_comment` first
 
    If the work isn't finished (tests fail, part of it couldn't be done), don't move it to Review: post the
    summary with `create_comment`, leave the issue In Progress and go to "Giving up".
@@ -92,16 +94,35 @@ Post a comment saying why and what a person needs to do or decide. Then call
 badge), e.g. `Blocked by BRD-12 (In Progress)` or `Needs a decision on the API shape`. Leave the issue in its
 status: the assignee moves it back when they hand it off again.
 
+## Artifacts
+
+An artifact is something you produce for the person that isn't a change to the repository: a Grafana dashboard JSON, a
+config to paste somewhere, a report, a migration plan. Attach it to the issue as a file instead of pasting it into a
+comment or leaving it in your answer, where nobody finds it later:
+
+- **When**: the person asked you to produce, generate or print it (not to commit it), or it's more than a few lines.
+  Code, configs or docs that belong in the repository are still committed, not attached.
+- **How**: `create_comment` with `files`, one file per artifact, `contentType` matching the extension and the content
+  base64-encoded. The comment says what each file is in one line (`- grafana-markdown-translator.json - the
+  dashboard, import it in Grafana`) - no code blocks with the artifact in the comment text.
+- **Names**: meaningful, with the right extension: `report.md`, `grafana-markdown-translator.json`. Only `.md`,
+  `.txt` and `.json` text files are accepted (UTF-8), so other text formats get `.txt` appended:
+  `nginx-rate-limit.conf.txt`, `cleanup.sql.txt`.
+- **Limit**: 10 MB per file. A larger artifact is committed to the branch, and the comment names its path instead.
+
 ## Sessions continued with `lba continue`
 
 After a run, the assignee may continue your session with `lba continue`, talking to you or giving one instruction.
 Such a session is a run of its own: laraue-boards-agent tells you its id ("continues your work on BRD-12 as agent
 run 15"). From then on that's the run id - the run you worked on before is over, so never finish it. The runner ends
-this run when the session ends (Done with new commits, after moving the issue to Review; cancelled without), so don't
+this run when the session ends (Done with new commits or artifacts, after moving the issue to Review; cancelled
+without), so don't
 change the issue's status or call `finish_agent_run` yourself - unless you give up: then
 `finish_agent_run(<that id>, "Failed", reason)`. Take instructions from the person in the session as from the assignee.
+The runner's summary lists only commits, so attach any artifact of the session yourself, as above: the runner counts
+your comments with files as the session's result, like commits.
 
 ## Comments
 
 Keep them short and in markdown. Write for the assignee, who will read them on the issue page later. Don't
-paste long logs: quote only the lines that matter.
+paste long logs: quote only the lines that matter. Artifacts go in files (see "Artifacts"), not in the text.
