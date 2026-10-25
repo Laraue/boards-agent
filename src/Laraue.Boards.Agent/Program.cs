@@ -1,10 +1,5 @@
-#!/usr/bin/env dotnet
-// laraue-boards-agent (lba): picks up Laraue Boards issues handed to the agent and works on them with a coding agent (Claude Code).
-// Run: dotnet run boards-agent.cs -- [setup] [--config <file>] [--once] [--dry-run] [--check] [--version]
-#:package ModelContextProtocol.Core@1.4.0
-#:property PublishAot=false
-#:property PublishTrimmed=true
-#:property JsonSerializerIsReflectionEnabledByDefault=false
+// laraue-boards-agent (lba): picks up Laraue Boards issues handed to the agent and works on them with a coding agent.
+// Run: dotnet run --project src/Laraue.Boards.Agent -- [setup] [--config <file>] [--once] [--dry-run] [--check] [--version]
 
 using System.Text.Json;
 using System.Text.Json.Nodes;
