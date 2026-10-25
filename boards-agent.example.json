@@ -22,6 +22,12 @@
   "workspace": "worktree",
   // After a Done run: "off" (you push the branch yourself), "push", or "pr" (push and open a pull request with gh).
   "publish": "off",
+  // Whose open pull request review comments a re-run gets: "off", "owner", "collaborators" or "anyone" (private
+  // repositories only); per repository below. `lba review-comments` changes both.
+  "reviewComments": "collaborators",
+  "repositoryReviewComments": {
+    "github.com/acme/internal-api": "anyone"
+  },
   // System notifications (as laraue-boards-agent) when a run starts, is ready for review, fails or is cancelled.
   "notifications": true,
   // Claude Code only: let interactive `lba continue` sessions use your Chrome (Claude in Chrome); runs never do.

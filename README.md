@@ -38,7 +38,20 @@ Setup asks; the `workspace` setting in the config holds the answer.
   - `push`: after a run ends Done, boards-agent pushes the issue's branch in every repository the agent committed to.
   - `pr`: it also opens a pull request with the [GitHub CLI](https://cli.github.com) (`gh`, signed in), or finds the one an earlier run of the issue opened.
   The runner's comment on the issue and the review notification carry the branches and pull requests. The agent itself still can't push: boards-agent does, after the run.
-  Review comments go back to the agent the same way: when you send the issue back (or hand it off again), boards-agent reads the open review comments of the branch's pull request with `gh` - unresolved line comments, and review summaries and comments newer than the branch's last commit - and gives them to the agent with the task. Write "fix the review comments" and that's enough. Only comments of the repository's owner, members and collaborators are passed on: on a public repository anyone can comment, and the agent runs builds and tests on your computer. The issue says how many were left out.
+  Review comments go back to the agent the same way: when you send the issue back (or hand it off again), boards-agent reads the open review comments of the branch's pull request with `gh` - unresolved line comments, and review summaries and comments newer than the branch's last commit - and gives them to the agent with the task. Write "fix the review comments" and that's enough.   Whose comments are passed on is your choice, since on a public repository anyone can comment and the agent runs builds and tests on your computer. Setup asks for the default; `lba review-comments` changes it for one repository. The issue says how many comments were left out.
+  - `off`: pull requests aren't read.
+  - `owner`: only the repository owner's. Best for personal repositories; on an organization's, GitHub rarely marks anyone as owner.
+  - `collaborators` (default): the owner's, the organization's members' and the repository's collaborators'.
+  - `anyone`: everyone who can comment. Only for private repositories; for a public one the command asks you to confirm.
+
+  ```bash
+  lba review-comments                      # your spaces' repositories, their visibility and level
+  lba review-comments anyone               # in a clone: that repository
+  lba review-comments acme/api owner       # a repository by name
+  lba review-comments acme/api default     # back to the default level
+  lba review-comments --default owner      # the default level
+  ```
+  The level stays in this computer's config, not in Boards: it protects the computer the agent runs on, so nobody else can raise it. The runner reads it at each run, so a change needs no restart.
 - **Feedback, right here: `lba continue`.** Opens the agent's session of an issue in your terminal - the same Claude Code or Codex conversation, with everything it knew, in the same repositories and on the issue's branch. Talk to it ("the button is still blue", "add a test"), see the changes and run the app straight away: no hand-off in Boards, no waiting.
   ```bash
   lba continue                              # the issue of the branch you're on, else your agent's last run
@@ -87,8 +100,9 @@ Run `lba setup`, ideally from inside the repository you want the agent to work i
 3. Asks which folder your repositories are cloned under (e.g. `~/Repos`; searched three levels deep) - type it, or choose it in Finder or Explorer - and shows, per space, which of its repositories it found there by git remote, and which aren't cloned. New branches start from each remote's default branch (e.g. `origin/main`). If no space links to a repository yet, add the repository's URL as a link on the space in Boards, or map one by hand.
 4. Asks where the agent should work: a worktree per issue, or your own clones (see [Where the agent works](#where-the-agent-works)).
 5. Asks what happens to the agent's branch when it's done: nothing, push it, or push it and open a pull request (see [When the agent is done](#when-the-agent-is-done)).
-6. Signs the agent in if it isn't (`claude auth login` or `codex login`).
-7. Offers to run the agent in the background (macOS and Windows), so there's no terminal to keep open. After that, clicking **Hand to agent** in Boards is all there is to it.
+6. Asks whose pull request review comments the agent gets when an issue goes back to it; `lba review-comments` changes it per repository later.
+7. Signs the agent in if it isn't (`claude auth login` or `codex login`).
+8. Offers to run the agent in the background (macOS and Windows), so there's no terminal to keep open. After that, clicking **Hand to agent** in Boards is all there is to it.
 
 The answers go to `~/.config/boards-agent/config.json` (`%APPDATA%\boards-agent\config.json` on Windows), which the runner reads by default. Running setup again keeps what's there. Use `--no-browser` to just print the link, e.g. over SSH. `--config <file>` points both setup and the runner at another config file; `boards-agent.example.json` lists every setting. Setting `BOARDS_AGENT_API_KEY` overrides the stored key.
 
@@ -106,7 +120,7 @@ The macOS binaries aren't notarized yet. If macOS refuses to open the binary, al
 
 ## Commands
 
-`lba` (or `laraue-boards-agent`) runs in the foreground. `--check` prints the version, which agent it found, and who your key signs in as. `--dry-run` lists Ready runs without claiming them. `--once` polls once and exits.
+`lba` (or `laraue-boards-agent`) runs in the foreground. `--check` prints the version, which agent it found, and who your key signs in as. `--dry-run` lists Ready runs without claiming them. `--once` polls once and exits. `lba review-comments` shows and changes whose review comments re-runs get (see [When the agent is done](#when-the-agent-is-done)).
 
 ## Release
 
