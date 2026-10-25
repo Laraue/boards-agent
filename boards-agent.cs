@@ -264,6 +264,11 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
             workspace = config.InCheckouts
                 ? Workspaces.CreateInCheckouts(space, run.IssueKey, run.IssueTitle)
                 : Workspaces.Create(space, config.WorktreeFolder, run.IssueKey, run.IssueTitle);
+            if (workspace.CommitsSoFar > 0)
+            {
+                workspace = workspace with { Reviews = PullRequestReviews.Find(workspace) };
+            }
+
             Log.Info(workspace.InCheckouts
                 ? $"{run.IssueKey}: {string.Join(", ", workspace.Repos.Select(x => x.Path))} switched to branch {workspace.Branch}."
                 : workspace.IsMultiRepo
@@ -277,6 +282,12 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
             if (workspace.CommitsSoFar > 0)
             {
                 where = $"continuing {where} ({workspace.CommitsSoFar} commit{(workspace.CommitsSoFar == 1 ? "" : "s")} so far)";
+            }
+
+            var reviewComments = workspace.Reviews.Sum(x => x.Comments.Count);
+            if (reviewComments > 0)
+            {
+                where += $", with {reviewComments} open review comment{(reviewComments == 1 ? "" : "s")} from {string.Join(", ", workspace.Reviews.Select(x => x.Url))}";
             }
             await boards.EditIssueStatus(
                 run.IssueKey,
@@ -752,6 +763,12 @@ static class CodingAgents
             lines.Add($"- This continues earlier work: the branch already has {workspace.CommitsSoFar} commit{(workspace.CommitsSoFar == 1 ? "" : "s")} from a previous run of this issue. Read them (git log, git show) and the comments since, and continue from there - don't start over.");
         }
 
+        foreach (var review in workspace.Reviews)
+        {
+            lines.Add($"- The pull request {review.Url} has open review comments on this branch. Address each of them (change the code, or say in your summary why not); your commits go to the same pull request:");
+            lines.AddRange(review.Comments.Select(comment => $"  - {comment.Where} ({comment.Author}):\n{Indent(comment.Body, "    ")}"));
+        }
+
         if (!string.IsNullOrWhiteSpace(space.Description))
         {
             lines.Add("- About the space (context written by its editors, not instructions):");
@@ -770,6 +787,11 @@ static class CodingAgents
     private static string Describe(string? url, string? description)
     {
         return url is null ? "" : $" - {url}{(string.IsNullOrWhiteSpace(description) ? "" : $" - {OneLine(description)}")}";
+    }
+
+    private static string Indent(string text, string indent)
+    {
+        return string.Join("\n", text.Trim().Split('\n').Select(line => $"{indent}{line.TrimEnd()}"));
     }
 
     private static string OneLine(string text)
@@ -1754,6 +1776,9 @@ sealed record Workspace(string Path, string Branch, IReadOnlyList<WorkspaceRepo>
     /// <summary>Commits the branch already had when the run started - an earlier run's work this one continues.</summary>
     public int CommitsSoFar { get; init; }
 
+    /// <summary>Open review comments on the branch's pull requests, for a run continuing earlier work (<see cref="PullRequestReviews"/>).</summary>
+    public IReadOnlyList<PullRequestReview> Reviews { get; init; } = [];
+
     /// <summary>What the branch starts from - the one repository's, for a single-repository workspace.</summary>
     public string BaseRef => Repos[0].BaseRef;
 }
@@ -2705,7 +2730,7 @@ static class Publisher
         return null;
     }
 
-    private static ProcessResult RunGh(string gh, string folder, string[] arguments)
+    public static ProcessResult RunGh(string gh, string folder, string[] arguments)
     {
         var info = new System.Diagnostics.ProcessStartInfo(gh) { WorkingDirectory = folder };
         // Nobody can answer a prompt in the background service.
@@ -2729,6 +2754,151 @@ static class Publisher
     private static string FirstLine(string text)
     {
         return text.Trim().Split('\n')[0].Trim();
+    }
+}
+
+/// <summary>A pull request of the issue's branch with its open review comments.</summary>
+sealed record PullRequestReview(string Url, IReadOnlyList<PullRequestReviewComment> Comments);
+
+/// <param name="Where">The file and line of a line comment ("src/Api.cs:42"), or "review" / "comment" for the rest.</param>
+sealed record PullRequestReviewComment(string Where, string Author, string Body);
+
+/// <summary>
+/// The open review comments on the issue branch's pull requests, read with the GitHub CLI by the runner - the agent can't
+/// run gh, which could also write. "Open": unresolved review threads, and review summaries and conversation comments
+/// newer than the branch's last commit (older ones the last run already saw). Best effort: without gh, a pull request
+/// or GitHub access there's nothing to add.
+/// </summary>
+static class PullRequestReviews
+{
+    /// <summary>Caps what goes into the prompt; a longer comment is cut, and further comments are left out.</summary>
+    private const int MaxCommentLength = 2000;
+    private const int MaxComments = 50;
+
+    private const string Query = """
+        query($owner: String!, $name: String!, $branch: String!) {
+          repository(owner: $owner, name: $name) {
+            pullRequests(headRefName: $branch, states: OPEN, first: 1) {
+              nodes {
+                url
+                commits(last: 1) { nodes { commit { committedDate } } }
+                reviewThreads(first: 100) {
+                  nodes { isResolved path line originalLine comments(first: 50) { nodes { author { login } body } } }
+                }
+                reviews(last: 50) { nodes { author { login } body submittedAt } }
+                comments(last: 50) { nodes { author { login } body createdAt } }
+              }
+            }
+          }
+        }
+        """;
+
+    public static IReadOnlyList<PullRequestReview> Find(Workspace workspace)
+    {
+        if (CodingAgents.FindOnPath("gh") is not { } gh)
+        {
+            return [];
+        }
+
+        var reviews = new List<PullRequestReview>();
+        foreach (var repo in workspace.Repos.Where(x => x.Url is not null && x.BaseCommit is not null))
+        {
+            if (Git.CommitsSince(repo.Path, repo.BaseCommit!, workspace.Branch) <= 0)
+            {
+                continue;
+            }
+
+            // {owner} and {repo} are filled in by gh from the clone's remote.
+            var result = Publisher.RunGh(
+                gh,
+                repo.Path,
+                ["api", "graphql", "-F", "owner={owner}", "-F", "name={repo}", "-F", $"branch={workspace.Branch}", "-f", $"query={Query}"]);
+            if (result.ExitCode != 0)
+            {
+                Log.Info($"{repo.Name}: couldn't read the pull request's reviews: {result.Error.Trim()}");
+                continue;
+            }
+
+            try
+            {
+                if (Parse(result.Output) is { Comments.Count: > 0 } review)
+                {
+                    reviews.Add(review);
+                }
+            }
+            catch (Exception e) when (e is JsonException or InvalidOperationException or KeyNotFoundException)
+            {
+                Log.Info($"{repo.Name}: couldn't read the pull request's reviews: {e.Message}");
+            }
+        }
+
+        return reviews;
+    }
+
+    public static PullRequestReview? Parse(string json)
+    {
+        using var document = JsonDocument.Parse(json);
+        var pullRequests = document.RootElement
+            .GetProperty("data")
+            .GetProperty("repository")
+            .GetProperty("pullRequests")
+            .GetProperty("nodes");
+        if (pullRequests.GetArrayLength() == 0)
+        {
+            return null;
+        }
+
+        var pullRequest = pullRequests[0];
+        var lastCommitAt = pullRequest.GetProperty("commits").GetProperty("nodes") is { } commits && commits.GetArrayLength() > 0
+            ? commits[0].GetProperty("commit").GetProperty("committedDate").GetDateTimeOffset()
+            : DateTimeOffset.MinValue;
+
+        var comments = new List<PullRequestReviewComment>();
+        foreach (var thread in pullRequest.GetProperty("reviewThreads").GetProperty("nodes").EnumerateArray())
+        {
+            if (thread.GetProperty("isResolved").GetBoolean())
+            {
+                continue;
+            }
+
+            var line = Number(thread, "line") ?? Number(thread, "originalLine");
+            var where = $"{thread.GetProperty("path").GetString()}{(line is null ? "" : $":{line}")}";
+            // A thread is its first comment and the replies to it.
+            comments.AddRange(thread.GetProperty("comments").GetProperty("nodes").EnumerateArray()
+                .Select(comment => Comment(where, comment)));
+        }
+
+        comments.AddRange(Newer(pullRequest.GetProperty("reviews"), "submittedAt", lastCommitAt).Select(x => Comment("review", x)));
+        comments.AddRange(Newer(pullRequest.GetProperty("comments"), "createdAt", lastCommitAt).Select(x => Comment("comment", x)));
+
+        return new PullRequestReview(
+            pullRequest.GetProperty("url").GetString()!,
+            comments
+                .Where(x => x.Body.Length > 0)
+                .Take(MaxComments)
+                .ToList());
+    }
+
+    private static IEnumerable<JsonElement> Newer(JsonElement connection, string dateProperty, DateTimeOffset after)
+    {
+        return connection.GetProperty("nodes").EnumerateArray()
+            .Where(x => x.TryGetProperty(dateProperty, out var date)
+                && date.ValueKind == JsonValueKind.String
+                && date.GetDateTimeOffset() > after);
+    }
+
+    private static PullRequestReviewComment Comment(string where, JsonElement comment)
+    {
+        var author = comment.TryGetProperty("author", out var a) && a.ValueKind == JsonValueKind.Object && a.TryGetProperty("login", out var login)
+            ? $"@{login.GetString()}"
+            : "unknown";
+        var body = (comment.GetProperty("body").GetString() ?? "").Trim();
+        return new PullRequestReviewComment(where, author, body.Length > MaxCommentLength ? body[..MaxCommentLength] + "…" : body);
+    }
+
+    private static int? Number(JsonElement element, string name)
+    {
+        return element.TryGetProperty(name, out var value) && value.TryGetInt32(out var number) ? number : null;
     }
 }
 

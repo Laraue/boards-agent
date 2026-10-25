@@ -38,6 +38,7 @@ Setup asks; the `workspace` setting in the config holds the answer.
   - `push`: after a run ends Done, boards-agent pushes the issue's branch in every repository the agent committed to.
   - `pr`: it also opens a pull request with the [GitHub CLI](https://cli.github.com) (`gh`, signed in), or finds the one an earlier run of the issue opened.
   The runner's comment on the issue and the review notification carry the branches and pull requests. The agent itself still can't push: boards-agent does, after the run.
+  Review comments go back to the agent the same way: when you send the issue back (or hand it off again), boards-agent reads the open review comments of the branch's pull request with `gh` - unresolved line comments, and review summaries and comments newer than the branch's last commit - and gives them to the agent with the task. Write "fix the review comments" and that's enough.
 - **Feedback, right here: `lba continue`.** Opens the agent's session of an issue in your terminal - the same Claude Code or Codex conversation, with everything it knew, in the same repositories and on the issue's branch. Talk to it ("the button is still blue", "add a test"), see the changes and run the app straight away: no hand-off in Boards, no waiting.
   ```bash
   lba continue                              # the issue of the branch you're on, else your agent's last run
