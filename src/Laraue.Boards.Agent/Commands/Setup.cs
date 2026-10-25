@@ -36,95 +36,132 @@ static class Setup
 
         config = config with { Agent = codingAgent.Key };
 
-        // 2. Boards: reuse a stored key that still works, unless the person wants another organization.
+        // 2. Boards.
+        if (await SignInToBoards(config, codingAgent, options, ct) is not { } access)
+        {
+            return 1;
+        }
+
+        // 3. Where the code is.
+        var repositories = await FindRepositories(access.Config, access.ApiKey, options, ct);
+
+        // 4.-7. How the agent works.
+        config = AskHowTheAgentWorks(repositories.Config, codingAgent);
+        config.Save(options.ConfigPath);
+        Console.WriteLine($"Saved {options.ConfigPath}.");
+
+        // 8. The coding agent's own sign-in.
+        if (EnsureAgentSignedIn(codingAgent) is not { } executable)
+        {
+            return 1;
+        }
+
+        Console.WriteLine($"{codingAgent.Name}: {executable} (signed in).");
+        return OfferBackgroundService(options, repositories.Any);
+    }
+
+    private sealed record BoardsAccess(RunnerConfig Config, string ApiKey);
+
+    /// <summary>
+    /// Reuses a stored key that still works, unless the person wants another organization; else signs in through the
+    /// browser and stores the new key. Null when the sign-in didn't complete.
+    /// </summary>
+    private static async Task<BoardsAccess?> SignInToBoards(RunnerConfig config, ICodingAgent codingAgent, RunnerArgs options, CancellationToken ct)
+    {
         var apiKey = ApiKeySource.Resolve(config);
-        MeInfo? me = apiKey is null ? null : await TryGetMe(config.McpUrl, apiKey, ct);
-        if (me is not null && !Confirm($"Signed in to Boards as {me.User.DisplayName}, organization {me.Organization.Name}. Keep it?", defaultYes: true))
+        var me = apiKey is null ? null : await TryGetMe(config.McpUrl, apiKey, ct);
+        if (me is not null && ConsolePrompt.Confirm($"Signed in to Boards as {me.User.DisplayName}, organization {me.Organization.Name}. Keep it?", defaultYes: true))
         {
-            me = null;
+            return new BoardsAccess(config, apiKey!);
         }
 
-        if (me is null)
+        // Only the key this machine stored itself, never BOARDS_AGENT_API_KEY, which may be a key made for something else.
+        var storedKey = config.OrganizationId is { } previousOrganizationId
+            ? CredentialStore.Load(CredentialStore.Account(previousOrganizationId))
+            : null;
+        var signedIn = await BoardsSignIn.RunAsync(config, codingAgent.ClientName, !options.NoBrowser, storedKey, ct);
+        if (signedIn is null)
         {
-            // Only the key this machine stored itself, never BOARDS_AGENT_API_KEY, which may be a key made for something else.
-            var storedKey = config.OrganizationId is { } previousOrganizationId
-                ? CredentialStore.Load(CredentialStore.Account(previousOrganizationId))
-                : null;
-            var signedIn = await BoardsSignIn.RunAsync(config, codingAgent.ClientName, !options.NoBrowser, storedKey, ct);
-            if (signedIn is null)
-            {
-                return 1;
-            }
-
-            CredentialStore.Save(
-                CredentialStore.Account(signedIn.OrganizationId),
-                $"Boards agent - {signedIn.OrganizationName}",
-                signedIn.ApiKey);
-            apiKey = signedIn.ApiKey;
-            me = await TryGetMe(config.McpUrl, apiKey, ct)
-                ?? throw new InvalidOperationException($"The new API key doesn't work with {config.McpUrl}.");
-
-            // Spaces belong to an organization: another organization starts over.
-            if (config.OrganizationId != signedIn.OrganizationId)
-            {
-                config = config with { Spaces = [] };
-            }
-
-            config = config with { OrganizationId = signedIn.OrganizationId, OrganizationName = signedIn.OrganizationName };
-            Console.WriteLine($"Signed in as {me.User.DisplayName}, organization {me.Organization.Name}. The API key is in your {CredentialStoreName}.");
+            return null;
         }
 
-        // 3. Where the code is: a space's repositories are the clones its links point to, found by git remote.
+        CredentialStore.Save(
+            CredentialStore.Account(signedIn.OrganizationId),
+            $"Boards agent - {signedIn.OrganizationName}",
+            signedIn.ApiKey);
+        me = await TryGetMe(config.McpUrl, signedIn.ApiKey, ct)
+            ?? throw new InvalidOperationException($"The new API key doesn't work with {config.McpUrl}.");
+
+        // Spaces belong to an organization: another organization starts over.
+        if (config.OrganizationId != signedIn.OrganizationId)
+        {
+            config = config with { Spaces = [] };
+        }
+
+        config = config with { OrganizationId = signedIn.OrganizationId, OrganizationName = signedIn.OrganizationName };
+        Console.WriteLine($"Signed in as {me.User.DisplayName}, organization {me.Organization.Name}. The API key is in your {CredentialStoreName}.");
+        return new BoardsAccess(config, signedIn.ApiKey);
+    }
+
+    private sealed record Repositories(RunnerConfig Config, bool Any);
+
+    /// <summary>
+    /// Asks for the code folder and shows each space's repositories found there: a space's repositories are the clones
+    /// its links point to, found by git remote. With none, offers to map one by hand.
+    /// </summary>
+    private static async Task<Repositories> FindRepositories(RunnerConfig config, string apiKey, RunnerArgs options, CancellationToken ct)
+    {
         config = config with { CodeFolders = [AskCodeFolder(config, canPick: !options.NoBrowser && FolderPicker.IsSupported)] };
         var anyRepository = false;
-        await using (var boards = await BoardsClient.ConnectAsync(config.McpUrl, apiKey!, ct))
+        await using var boards = await BoardsClient.ConnectAsync(config.McpUrl, apiKey, ct);
+        var resolver = new SpaceResolver(boards, config, new CloneIndex(config.CodeFolders));
+        var spaces = await boards.ListSpaces(ct);
+        Console.WriteLine();
+        Console.WriteLine($"Your spaces' repositories under {config.CodeFolders[0]}:");
+        foreach (var space in spaces)
         {
-            var resolver = new SpaceResolver(boards, config, new CloneIndex(config.CodeFolders));
-            var spaces = await boards.ListSpaces(ct);
-            Console.WriteLine();
-            Console.WriteLine($"Your spaces' repositories under {config.CodeFolders[0]}:");
-            foreach (var space in spaces)
-            {
-                var context = await resolver.Resolve(space.Key, ct);
-                anyRepository |= context.Repos.Count > 0;
-                Console.WriteLine(Report(space, context));
-            }
-
-            if (!anyRepository)
-            {
-                Console.WriteLine();
-                Console.WriteLine("No space links to a repository cloned there yet. Add the repository's URL as a link of the space in "
-                    + "Boards (space settings) - the agent picks it up by itself - or map one by hand now.");
-                config = config with { Spaces = MapSpaces(spaces, config.Spaces) };
-                anyRepository = config.Spaces.Values.Any(x => x.Repo is not null);
-            }
+            var context = await resolver.Resolve(space.Key, ct);
+            anyRepository |= context.Repos.Count > 0;
+            Console.WriteLine(Report(space, context));
         }
 
-        // 4. Where the agent works: separate worktrees, or your own clones.
+        if (!anyRepository)
+        {
+            Console.WriteLine();
+            Console.WriteLine("No space links to a repository cloned there yet. Add the repository's URL as a link of the space in "
+                + "Boards (space settings) - the agent picks it up by itself - or map one by hand now.");
+            config = config with { Spaces = MapSpaces(spaces, config.Spaces) };
+            anyRepository = config.Spaces.Values.Any(x => x.Repo is not null);
+        }
+
+        return new Repositories(config, anyRepository);
+    }
+
+    /// <summary>Where the agent works, what happens to its work, whose review comments it gets, and whether it may use Chrome.</summary>
+    private static RunnerConfig AskHowTheAgentWorks(RunnerConfig config, ICodingAgent codingAgent)
+    {
         config = config with { Workspace = ChooseWorkspace(config) };
-
-        // 5. What happens to the agent's work: kept local, pushed, or a pull request.
         config = config with { Publish = ChoosePublish(config) };
-
-        // 6. Whose pull request review comments a re-run gets.
         config = config with { ReviewComments = ChooseReviewComments(config) };
 
-        // 7. Claude Code only: may it use your Chrome when you continue a session with it?
+        // Claude Code only: may it use your Chrome when you continue a session with it?
         if (codingAgent.Key == CodingAgents.Claude)
         {
             Console.WriteLine();
             config = config with
             {
-                Chrome = Confirm(
+                Chrome = ConsolePrompt.Confirm(
                     "When you continue an agent's session (lba continue), may Claude Code use your Chrome (the Claude in Chrome extension) to open the app and check its work? You approve each browser action; background runs never use the browser.",
                     defaultYes: config.Chrome),
             };
         }
 
-        config.Save(options.ConfigPath);
-        Console.WriteLine($"Saved {options.ConfigPath}.");
+        return config;
+    }
 
-        // 8. The coding agent's own sign-in.
+    /// <summary>The agent's executable once it's signed in (signing it in if needed); null, said why, when it can't be.</summary>
+    private static string? EnsureAgentSignedIn(ICodingAgent codingAgent)
+    {
         string executable;
         try
         {
@@ -133,7 +170,7 @@ static class Setup
         catch (FileNotFoundException)
         {
             Console.WriteLine($"{codingAgent.Name} isn't installed. Install it ({codingAgent.InstallUrl}), then run `lba setup` again.");
-            return 1;
+            return null;
         }
 
         if (!codingAgent.IsSignedIn(executable))
@@ -143,34 +180,40 @@ static class Setup
             if (!codingAgent.IsSignedIn(executable))
             {
                 Console.WriteLine($"{codingAgent.Name} still isn't signed in. Run `lba setup` again once it is.");
-                return 1;
+                return null;
             }
         }
 
-        Console.WriteLine($"{codingAgent.Name}: {executable} (signed in).");
+        return executable;
+    }
+
+    /// <summary>What's next: restarts the background service with the new settings, or offers to install it.</summary>
+    private static int OfferBackgroundService(RunnerArgs options, bool anyRepository)
+    {
         Console.WriteLine();
-        Console.WriteLine(anyRepository
-            ? "Done. The agent takes the issues you hand to it in the spaces above that have a repository here."
-            : "No space has a repository on this machine yet, so there's nothing to work on. Add your repositories as links of the space in Boards, then run `lba setup` again.");
-        if (anyRepository && Service.IsSupported)
+        if (!anyRepository)
         {
-            if (Service.IsInstalled)
-            {
-                // The running service read the old config at start. Restarting waits for it to stop, which takes a moment.
-                Console.WriteLine("Restarting the background service...");
-                Service.Restart();
-                Console.WriteLine("The background service was restarted with the new settings. Hand an issue to the agent in Boards.");
-            }
-            else if (Confirm("Run the agent in the background, also after you restart the computer?", defaultYes: true))
-            {
-                return Service.Install(options.ConfigPath);
-            }
-            else
-            {
-                Console.WriteLine("Start the runner with `lba`, then hand an issue to the agent in Boards.");
-            }
+            Console.WriteLine("No space has a repository on this machine yet, so there's nothing to work on. Add your repositories as links of the space in Boards, then run `lba setup` again.");
+            return 0;
         }
-        else if (anyRepository)
+
+        Console.WriteLine("Done. The agent takes the issues you hand to it in the spaces above that have a repository here.");
+        if (!Service.IsSupported)
+        {
+            Console.WriteLine("Start the runner with `lba`, then hand an issue to the agent in Boards.");
+        }
+        else if (Service.IsInstalled)
+        {
+            // The running service read the old config at start. Restarting waits for it to stop, which takes a moment.
+            Console.WriteLine("Restarting the background service...");
+            Service.Restart();
+            Console.WriteLine("The background service was restarted with the new settings. Hand an issue to the agent in Boards.");
+        }
+        else if (ConsolePrompt.Confirm("Run the agent in the background, also after you restart the computer?", defaultYes: true))
+        {
+            return Service.Install(options.ConfigPath);
+        }
+        else
         {
             Console.WriteLine("Start the runner with `lba`, then hand an issue to the agent in Boards.");
         }
@@ -198,121 +241,72 @@ static class Setup
         }
 
         var current = installed.FirstOrDefault(x => x.Key == config.Agent.ToLowerInvariant()) ?? installed[0];
-        Console.WriteLine();
-        Console.WriteLine("Which agent should work on the issues you hand off?");
-        for (var i = 0; i < installed.Count; i++)
-        {
-            Console.WriteLine($"  {i + 1}. {installed[i].Name}");
-        }
-
-        while (true)
-        {
-            var answer = Ask($"Number, or Enter for {current.Name}:");
-            if (answer.Length == 0)
-            {
-                return current;
-            }
-
-            if (int.TryParse(answer, out var number) && number >= 1 && number <= installed.Count)
-            {
-                return installed[number - 1];
-            }
-
-            Console.WriteLine($"Enter a number from 1 to {installed.Count}.");
-        }
+        var chosen = ConsolePrompt.Choose(
+            "Which agent should work on the issues you hand off?",
+            installed.Select(x => x.Name).ToList(),
+            installed.IndexOf(current),
+            defaultLabel: current.Name);
+        return installed[chosen];
     }
 
-    /// <summary>The workspace mode (<see cref="RunnerConfig.Workspace"/>), the config's current one by default.</summary>
     /// <summary>The publish mode (<see cref="RunnerConfig.Publish"/>), the config's current one by default.</summary>
     private static string ChoosePublish(RunnerConfig config)
     {
         string[] modes = [PublishModes.Off, PublishModes.Push, PublishModes.PullRequest];
-        var current = Array.IndexOf(modes, config.Publish.ToLowerInvariant()) + 1;
-        if (current == 0)
+        var mode = modes[ConsolePrompt.Choose(
+            "When the agent is done, what should happen to its branch?",
+            [
+                "Nothing - it stays on this computer, you review it and push it yourself.",
+                "Push it to the repository's remote.",
+                "Push it and open a pull request (needs the GitHub CLI, gh, signed in).",
+            ],
+            CurrentIndex(modes, config.Publish, fallback: 0),
+            note: "The agent itself never pushes: laraue-boards-agent does, after the run is done.")];
+        if (mode == PublishModes.PullRequest && CodingAgents.FindOnPath("gh") is null)
         {
-            current = 1;
+            Console.WriteLine("The GitHub CLI (gh) isn't installed: install it (https://cli.github.com) and run `gh auth login`, or the branch is only pushed.");
         }
 
-        Console.WriteLine();
-        Console.WriteLine("When the agent is done, what should happen to its branch?");
-        Console.WriteLine("  1. Nothing - it stays on this computer, you review it and push it yourself.");
-        Console.WriteLine("  2. Push it to the repository's remote.");
-        Console.WriteLine("  3. Push it and open a pull request (needs the GitHub CLI, gh, signed in).");
-        Console.WriteLine("  The agent itself never pushes: laraue-boards-agent does, after the run is done.");
-        while (true)
-        {
-            var answer = Ask($"Number, or Enter for {current}:");
-            var number = answer.Length == 0 ? current : int.TryParse(answer, out var parsed) ? parsed : 0;
-            if (number is >= 1 and <= 3)
-            {
-                if (modes[number - 1] == PublishModes.PullRequest && CodingAgents.FindOnPath("gh") is null)
-                {
-                    Console.WriteLine("The GitHub CLI (gh) isn't installed: install it (https://cli.github.com) and run `gh auth login`, or the branch is only pushed.");
-                }
-
-                return modes[number - 1];
-            }
-
-            Console.WriteLine("Enter 1, 2 or 3.");
-        }
+        return mode;
     }
 
     /// <summary>The global review comments level (<see cref="RunnerConfig.ReviewComments"/>), the config's current one by default.</summary>
     private static string ChooseReviewComments(RunnerConfig config)
     {
         string[] levels = [ReviewCommentLevels.Off, ReviewCommentLevels.Owner, ReviewCommentLevels.Collaborators, ReviewCommentLevels.Anyone];
-        var current = Array.IndexOf(levels, config.ReviewComments.ToLowerInvariant()) + 1;
-        if (current == 0)
-        {
-            current = 3;
-        }
-
-        Console.WriteLine();
-        Console.WriteLine("When an issue goes back to the agent, it gets the open review comments of the branch's pull request.");
-        Console.WriteLine("Whose comments? The agent runs builds and tests on this computer, so only people you trust should steer it.");
-        Console.WriteLine("  1. Nobody's - don't read pull requests.");
-        Console.WriteLine("  2. Only the repository owner's - for personal repositories; on an organization's, GitHub rarely marks anyone as owner.");
-        Console.WriteLine("  3. The owner's, organization members' and collaborators' - people with access to the repository (recommended).");
-        Console.WriteLine("  4. Anyone's - on a public repository that's anyone with a GitHub account; only for private repositories.");
-        Console.WriteLine("  For one repository, run `lba review-comments <level>` in its clone later.");
-        while (true)
-        {
-            var answer = Ask($"Number, or Enter for {current}:");
-            var number = answer.Length == 0 ? current : int.TryParse(answer, out var parsed) ? parsed : 0;
-            if (number is >= 1 and <= 4)
-            {
-                return levels[number - 1];
-            }
-
-            Console.WriteLine("Enter 1, 2, 3 or 4.");
-        }
+        return levels[ConsolePrompt.Choose(
+            "When an issue goes back to the agent, it gets the open review comments of the branch's pull request.\n"
+                + "Whose comments? The agent runs builds and tests on this computer, so only people you trust should steer it.",
+            [
+                "Nobody's - don't read pull requests.",
+                "Only the repository owner's - for personal repositories; on an organization's, GitHub rarely marks anyone as owner.",
+                "The owner's, organization members' and collaborators' - people with access to the repository (recommended).",
+                "Anyone's - on a public repository that's anyone with a GitHub account; only for private repositories.",
+            ],
+            CurrentIndex(levels, config.ReviewComments, fallback: 2),
+            note: "For one repository, run `lba review-comments <level>` in its clone later.")];
     }
 
+    /// <summary>The workspace mode (<see cref="RunnerConfig.Workspace"/>), the config's current one by default.</summary>
     private static string ChooseWorkspace(RunnerConfig config)
     {
         string[] modes = [WorkspaceModes.Worktree, WorkspaceModes.Checkout];
-        var current = config.InCheckouts ? 2 : 1;
-        Console.WriteLine();
-        Console.WriteLine("Where should the agent work?");
-        Console.WriteLine($"  1. In a separate git worktree per issue under {config.WorktreeFolder} - your clones aren't touched.");
-        Console.WriteLine("  2. In your own clones, one issue at a time: each switched to a new branch from the fetched default branch,");
-        Console.WriteLine("     so you review and run the result where you always work. Before switching a clone that has uncommitted");
-        Console.WriteLine("     changes or is on another branch, the agent asks you first.");
-        while (true)
-        {
-            var answer = Ask($"Number, or Enter for {current}:");
-            if (answer.Length == 0)
-            {
-                return modes[current - 1];
-            }
+        return modes[ConsolePrompt.Choose(
+            "Where should the agent work?",
+            [
+                $"In a separate git worktree per issue under {config.WorktreeFolder} - your clones aren't touched.",
+                "In your own clones, one issue at a time: each switched to a new branch from the fetched default branch,\n"
+                    + "so you review and run the result where you always work. Before switching a clone that has uncommitted\n"
+                    + "changes or is on another branch, the agent asks you first.",
+            ],
+            config.InCheckouts ? 1 : 0)];
+    }
 
-            if (int.TryParse(answer, out var number) && number is 1 or 2)
-            {
-                return modes[number - 1];
-            }
-
-            Console.WriteLine("Enter 1 or 2.");
-        }
+    /// <summary>The index of the config's current value among <paramref name="values"/>, or <paramref name="fallback"/>.</summary>
+    private static int CurrentIndex(string[] values, string current, int fallback)
+    {
+        var index = Array.IndexOf(values, current.ToLowerInvariant());
+        return index < 0 ? fallback : index;
     }
 
     private static bool IsInstalled(ICodingAgent agent)
@@ -362,7 +356,7 @@ static class Setup
 
         while (true)
         {
-            var answer = Ask(question);
+            var answer = ConsolePrompt.Ask(question);
             string? folder;
             if (answer.Length == 0 && current is not null)
             {
@@ -459,7 +453,7 @@ static class Setup
 
         while (AskSpace(spaces, mapped.Count == 0 ? "Map a space to a repository? Number, or Enter to finish:" : "Map another space? Number, or Enter to finish:") is { } space)
         {
-            var folder = Ask($"Folder of the {space.Key} repository (a git checkout):");
+            var folder = ConsolePrompt.Ask($"Folder of the {space.Key} repository (a git checkout):");
             var repo = folder.Length == 0 ? null : Git.FindCheckout(Paths.Expand(folder));
             if (repo is null)
             {
@@ -482,7 +476,7 @@ static class Setup
     {
         while (true)
         {
-            var answer = Ask(question);
+            var answer = ConsolePrompt.Ask(question);
             if (answer.Length == 0)
             {
                 return null;
@@ -503,16 +497,4 @@ static class Setup
         }
     }
 
-    public static bool Confirm(string question, bool defaultYes)
-    {
-        var answer = Ask($"{question} [{(defaultYes ? "Y/n" : "y/N")}]");
-        return answer.Length == 0 ? defaultYes : answer.StartsWith('y') || answer.StartsWith('Y');
-    }
-
-    private static string Ask(string question)
-    {
-        Console.Write($"{question} ");
-        // End of input (e.g. nothing piped in) counts as Enter.
-        return Console.ReadLine()?.Trim() ?? "";
-    }
 }

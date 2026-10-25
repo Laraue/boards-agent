@@ -3,28 +3,31 @@ using System.Text.Json.Nodes;
 namespace Laraue.Boards.Agent.Agents;
 
 /// <summary>
-/// A running agent working on one run. The process and its output are handled here - stdout goes to the log line by line,
-/// stderr too - and each agent reads its own output for the summary.
+/// A running agent working on one run: its process, with stdout and stderr written to the log line by line and stdout
+/// read by the agent's <see cref="AgentOutput"/>.
 /// </summary>
-abstract class AgentProcess : IDisposable
+sealed class AgentProcess : IDisposable
 {
     private readonly System.Diagnostics.Process _process;
     private readonly StreamWriter _log;
     private readonly Task _pump;
 
-    protected AgentProcess(System.Diagnostics.Process process, string logPath)
+    public AgentProcess(System.Diagnostics.Process process, string logPath, AgentOutput output)
     {
         _process = process;
+        Output = output;
         _log = new StreamWriter(logPath, append: true) { AutoFlush = true };
         _pump = Task.Run(Pump);
     }
+
+    public AgentOutput Output { get; }
 
     public int ProcessId => _process.Id;
 
     public int ExitCode => _process.ExitCode;
 
-    /// <summary>The agent's session, which `lba continue` resumes; null until the agent said it.</summary>
-    public string? SessionId { get; protected set; }
+    /// <inheritdoc cref="AgentOutput.SessionId"/>
+    public string? SessionId => Output.SessionId;
 
     /// <summary>Starts an agent's process with its output captured and no input.</summary>
     public static System.Diagnostics.Process Launch(System.Diagnostics.ProcessStartInfo info)
@@ -52,31 +55,21 @@ abstract class AgentProcess : IDisposable
         _process.WaitForExit();
     }
 
-    /// <summary>How the agent ended, for the log and the issue comment: outcome, turns, cost.</summary>
-    public abstract string Summary();
+    /// <inheritdoc cref="AgentOutput.Summary"/>
+    public string Summary() => Output.Summary();
 
-    /// <summary>The agent's last message to the person - its answer; null when it said nothing.</summary>
-    public abstract string? FinalMessage();
+    /// <inheritdoc cref="AgentOutput.FinalMessage"/>
+    public string? FinalMessage() => Output.FinalMessage();
 
-    /// <summary>The agent stopped at its turn limit (Claude Code's error_max_turns), not because it was done or stuck.</summary>
-    public virtual bool HitTurnLimit => false;
+    /// <inheritdoc cref="AgentOutput.HitTurnLimit"/>
+    public bool HitTurnLimit => Output.HitTurnLimit;
 
-    /// <summary>
-    /// Called with one line per step the agent takes - a command, an edit, a Boards call - so `lba continue` with an
-    /// instruction shows it working instead of a silent terminal.
-    /// </summary>
-    public Action<string>? OnStep { get; set; }
-
-    protected void Step(string? text)
+    /// <inheritdoc cref="AgentOutput.OnStep"/>
+    public Action<string>? OnStep
     {
-        if (OnStep is { } onStep && text?.Split('\n')[0].Trim() is { Length: > 0 } line)
-        {
-            onStep(line.Length > 120 ? line[..119] + "…" : line);
-        }
+        get => Output.OnStep;
+        set => Output.OnStep = value;
     }
-
-    /// <summary>One line of the agent's stdout, already written to the log.</summary>
-    protected abstract void OnOutputLine(string line);
 
     private async Task Pump()
     {
@@ -98,7 +91,7 @@ abstract class AgentProcess : IDisposable
                 _log.WriteLine(line);
             }
 
-            OnOutputLine(line);
+            Output.Read(line);
         }
 
         await stderr;

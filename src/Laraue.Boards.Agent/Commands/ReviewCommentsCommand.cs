@@ -40,7 +40,7 @@ static class ReviewCommentsCommand
         var newLevel = Level(arguments[^1], allowReset: true);
         if (newLevel == ReviewCommentLevels.Anyone
             && Visibility(repository) != "PRIVATE"
-            && !Setup.Confirm($"{repository} isn't known to be private: anyone with a GitHub account could steer the agent on this computer with a comment. Trust anyone's comments anyway?", defaultYes: false))
+            && !ConsolePrompt.Confirm($"{repository} isn't known to be private: anyone with a GitHub account could steer the agent on this computer with a comment. Trust anyone's comments anyway?", defaultYes: false))
         {
             return 1;
         }

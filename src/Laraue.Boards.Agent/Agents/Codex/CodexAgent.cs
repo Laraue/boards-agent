@@ -53,14 +53,14 @@ sealed class CodexAgent(RunnerConfig config) : ICodingAgent
     {
         var info = Info(apiKey, workspace);
         AddArguments(info, ["exec", "--json", .. Options(workspace), CodingAgents.Prompt("work-on-issue", run, workspace)]);
-        return new CodexProcess(AgentProcess.Launch(info), logPath);
+        return new AgentProcess(AgentProcess.Launch(info), logPath, new CodexOutput());
     }
 
     public AgentProcess Resume(string apiKey, string issueKey, Workspace workspace, string sessionId, string instruction, string logPath)
     {
         var info = Info(apiKey, workspace);
         AddArguments(info, ["exec", "--json", .. Options(workspace), "resume", sessionId, instruction]);
-        return new CodexProcess(AgentProcess.Launch(info), logPath);
+        return new AgentProcess(AgentProcess.Launch(info), logPath, new CodexOutput());
     }
 
     public int ResumeInteractive(string apiKey, string issueKey, Workspace workspace, string sessionId, string? context)

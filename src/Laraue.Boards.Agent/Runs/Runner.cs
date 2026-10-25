@@ -28,51 +28,7 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
         Workspace workspace;
         try
         {
-            var statuses = await FindEpicStatuses(space.Key, run.IssueKey, ct);
-            var inProgress = statuses.Statuses.First(x => x.CategoryId == StatusCategories.InProgress);
-
-            workspace = config.InCheckouts
-                ? WorkspaceManager.CreateInCheckouts(space, run.IssueKey, run.IssueTitle)
-                : WorkspaceManager.Create(space, config.WorktreeFolder, run.IssueKey, run.IssueTitle);
-            if (workspace.CommitsSoFar > 0)
-            {
-                // Read from the file, not the config the runner started with: `lba review-comments` changes it while the
-                // service runs.
-                workspace = workspace with { Reviews = PullRequestReviews.Find(workspace, RunnerConfig.TryLoad(configPath) ?? config) };
-            }
-
-            Log.Info(workspace.InCheckouts
-                ? $"{run.IssueKey}: {string.Join(", ", workspace.Repos.Select(x => x.Path))} switched to branch {workspace.Branch}."
-                : workspace.IsMultiRepo
-                    ? $"{run.IssueKey}: workspace {workspace.Path} with {string.Join(", ", workspace.Repos.Select(x => x.Name))} on branch {workspace.Branch}."
-                    : $"{run.IssueKey}: worktree {workspace.Path} on branch {workspace.Branch}.");
-            RunsInProgress.Save(runFilePath, new RunInProgress(run.Id, run.IssueKey, RunInProgressWorkspace.Of(workspace)));
-
-            var where = workspace.IsMultiRepo || workspace.InCheckouts
-                ? $"branch `{workspace.Branch}` in {string.Join(", ", workspace.Repos.Select(x => x.Name))}"
-                : $"branch `{workspace.Branch}`";
-            if (workspace.CommitsSoFar > 0)
-            {
-                where = $"continuing {where} ({workspace.CommitsSoFar} commit{(workspace.CommitsSoFar == 1 ? "" : "s")} so far)";
-            }
-
-            var reviewComments = workspace.Reviews.Sum(x => x.Comments.Count);
-            if (reviewComments > 0)
-            {
-                where += $", with {reviewComments} open review comment{(reviewComments == 1 ? "" : "s")} from {string.Join(", ", workspace.Reviews.Where(x => x.Comments.Count > 0).Select(x => $"{x.Url} ({x.Level})"))}";
-            }
-
-            var skipped = workspace.Reviews.Sum(x => x.Skipped);
-            if (skipped > 0)
-            {
-                where += $" ({skipped} comment{(skipped == 1 ? "" : "s")} by people this computer doesn't trust left out - see `lba review-comments`)";
-            }
-            await boards.EditIssueStatus(
-                run.IssueKey,
-                inProgress.Id,
-                $"laraue-boards-agent picked this up on {Environment.MachineName}, {where}.",
-                ct);
-            Log.Info($"{run.IssueKey}: moved to {inProgress.Name} ({statuses.EpicName}).");
+            workspace = await Start(space, run, ct);
         }
         catch (Exception e) when (!ct.IsCancellationRequested)
         {
@@ -130,20 +86,82 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
         }
 
         Log.Info($"{saved.IssueKey}: run {saved.RunId} was still Working when the runner stopped and can't be resumed - failing it.");
-        var branches = "";
-        if (workspace is not null)
-        {
-            var changed = WorkspaceManager.Finish(workspace);
-            branches = changed.Count == 0
-                ? "\n\nNo repository got commits."
-                : "\n\nBranches with commits:\n" + string.Join("\n", changed.Select(x => $"- {x}"));
-        }
-
+        var branches = workspace is null ? "" : ActiveRun.BranchesText(WorkspaceManager.Finish(workspace));
         await Fail(
             run,
             "The runner stopped during the work",
             $"laraue-boards-agent on {Environment.MachineName} stopped while the agent was working and couldn't resume it, so the work was cut off. What the agent did so far stays on its branch." + branches);
         RunsInProgress.Clear(runFilePath);
+    }
+
+    /// <summary>
+    /// Gets the run going: the workspace on the issue's branch, recorded in the run file, and the issue moved to its epic's
+    /// In Progress status with a comment saying where the agent works.
+    /// </summary>
+    private async Task<Workspace> Start(SpaceContext space, AgentRunSummary run, CancellationToken ct)
+    {
+        var statuses = await FindEpicStatuses(space.Key, run.IssueKey, ct);
+        var inProgress = statuses.Statuses.First(x => x.CategoryId == StatusCategories.InProgress);
+
+        var workspace = CreateWorkspace(space, run);
+        RunsInProgress.Save(runFilePath, new RunInProgress(run.Id, run.IssueKey, RunInProgressWorkspace.Of(workspace)));
+
+        await boards.EditIssueStatus(run.IssueKey, inProgress.Id, PickUpComment(workspace, Environment.MachineName), ct);
+        Log.Info($"{run.IssueKey}: moved to {inProgress.Name} ({statuses.EpicName}).");
+        return workspace;
+    }
+
+    /// <summary>The issue's workspace, with the open review comments of its pull requests when it continues earlier work.</summary>
+    private Workspace CreateWorkspace(SpaceContext space, AgentRunSummary run)
+    {
+        var workspace = config.InCheckouts
+            ? WorkspaceManager.CreateInCheckouts(space, run.IssueKey, run.IssueTitle)
+            : WorkspaceManager.Create(space, config.WorktreeFolder, run.IssueKey, run.IssueTitle);
+        if (workspace.CommitsSoFar > 0)
+        {
+            // Read from the file, not the config the runner started with: `lba review-comments` changes it while the
+            // service runs.
+            workspace = workspace with { Reviews = PullRequestReviews.Find(workspace, RunnerConfig.TryLoad(configPath) ?? config) };
+        }
+
+        Log.Info(workspace.InCheckouts
+            ? $"{run.IssueKey}: {string.Join(", ", workspace.Repos.Select(x => x.Path))} switched to branch {workspace.Branch}."
+            : workspace.IsMultiRepo
+                ? $"{run.IssueKey}: workspace {workspace.Path} with {string.Join(", ", workspace.Repos.Select(x => x.Name))} on branch {workspace.Branch}."
+                : $"{run.IssueKey}: worktree {workspace.Path} on branch {workspace.Branch}.");
+        return workspace;
+    }
+
+    /// <summary>
+    /// The comment of the move to In Progress: which machine took the issue, on which branch in which repositories, the
+    /// commits it continues and the review comments it got.
+    /// </summary>
+    public static string PickUpComment(Workspace workspace, string machineName)
+    {
+        var where = workspace.IsMultiRepo || workspace.InCheckouts
+            ? $"branch `{workspace.Branch}` in {string.Join(", ", workspace.Repos.Select(x => x.Name))}"
+            : $"branch `{workspace.Branch}`";
+        if (workspace.CommitsSoFar > 0)
+        {
+            where = $"continuing {where} ({workspace.CommitsSoFar} commit{(workspace.CommitsSoFar == 1 ? "" : "s")} so far)";
+        }
+
+        var reviewComments = workspace.Reviews.Sum(x => x.Comments.Count);
+        if (reviewComments > 0)
+        {
+            var reviews = workspace.Reviews
+                .Where(x => x.Comments.Count > 0)
+                .Select(x => $"{x.Url} ({x.Level})");
+            where += $", with {reviewComments} open review comment{(reviewComments == 1 ? "" : "s")} from {string.Join(", ", reviews)}";
+        }
+
+        var skipped = workspace.Reviews.Sum(x => x.Skipped);
+        if (skipped > 0)
+        {
+            where += $" ({skipped} comment{(skipped == 1 ? "" : "s")} by people this computer doesn't trust left out - see `lba review-comments`)";
+        }
+
+        return $"laraue-boards-agent picked this up on {machineName}, {where}.";
     }
 
     /// <summary>
@@ -156,136 +174,102 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
     private async Task<bool> Work(AgentRunSummary run, Workspace workspace, string? resumeSessionId, CancellationToken ct)
     {
         var logPath = Path.Combine(config.WorktreeFolder, $"{run.IssueKey}.run-{run.Id}.jsonl");
-        var sessionId = resumeSessionId;
         var agent = resumeSessionId is null
             ? codingAgent.Start(apiKey, run, workspace, logPath)
             : codingAgent.Resume(apiKey, run.IssueKey, workspace, resumeSessionId, ResumePrompt(run, "laraue-boards-agent was restarted while you were working, so you were interrupted."), logPath);
-        try
+        using var active = new ActiveRun(run, workspace, runFilePath, codingAgent.Key, agent, resumeSessionId);
+
+        Log.Info($"{run.IssueKey}: {codingAgent.Name} {(resumeSessionId is null ? "started" : "resumed")} (pid {agent.ProcessId}), log {logPath}.");
+        if (resumeSessionId is null)
         {
-            // The session goes into the run record as soon as the agent says it, so a restart - or a crash - can resume it.
-            void RecordSession()
+            Notifications.Show(config, $"{run.IssueKey} · agent started", run.IssueTitle, run.IssueUrl);
+        }
+
+        var deadline = DateTime.UtcNow.AddMinutes(config.TimeoutMinutes);
+        var continuations = 0;
+        while (true)
+        {
+            Task tick = Task.Delay(TimeSpan.FromSeconds(config.CancelCheckSeconds), CancellationToken.None);
+            Task exited = active.Agent.WaitForExitAsync();
+            var stopped = Task.Delay(Timeout.Infinite, ct);
+            var first = await Task.WhenAny(exited, tick, stopped);
+            active.RecordSession();
+
+            if (first == stopped)
             {
-                if (agent.SessionId is { } id && id != sessionId)
-                {
-                    sessionId = id;
-                    if (RunsInProgress.Load(runFilePath) is { } record && record.RunId == run.Id)
-                    {
-                        RunsInProgress.Save(runFilePath, record with { SessionId = id });
-                    }
-                }
+                Stop(active);
+                return true;
             }
 
-            void SaveSession()
+            if (first == exited)
             {
-                RecordSession();
-                if (sessionId is not null)
+                var finalState = await GetRunState(run, CancellationToken.None);
+                Log.Info($"{run.IssueKey}: {codingAgent.Name} exited ({active.Agent.ExitCode}), run {run.Id} is {finalState}. {active.Agent.Summary()}");
+                if (finalState == AgentRunStates.Working
+                    && active.Agent.HitTurnLimit
+                    && continuations < config.MaxContinuations
+                    && DateTime.UtcNow < deadline
+                    && active.SessionId is { } sessionId)
                 {
-                    AgentSessions.Save(
-                        runFilePath,
-                        new AgentSession(run.IssueKey, run.IssueTitle, run.IssueUrl, codingAgent.Key, sessionId, RunInProgressWorkspace.Of(workspace)));
-                }
-            }
-
-            // However the run ends: what the agent didn't commit to is put back, and the runner's comment says which
-            // branches have commits - right even if the agent's own summary misses one.
-            string? branches = null;
-            string Branches()
-            {
-                if (branches is null)
-                {
-                    // Every ending passes here once: the session is kept for `lba continue`.
-                    SaveSession();
-                    var changed = WorkspaceManager.Finish(workspace);
-                    branches = !workspace.IsMultiRepo && !workspace.InCheckouts
-                        ? ""
-                        : changed.Count == 0
-                            ? "\n\nNo repository got commits."
-                            : "\n\nBranches with commits:\n" + string.Join("\n", changed.Select(x => $"- {x}"));
-                }
-
-                return branches;
-            }
-
-            Log.Info($"{run.IssueKey}: {codingAgent.Name} {(resumeSessionId is null ? "started" : "resumed")} (pid {agent.ProcessId}), log {logPath}.");
-            if (resumeSessionId is null)
-            {
-                Notifications.Show(config, $"{run.IssueKey} · agent started", run.IssueTitle, run.IssueUrl);
-            }
-
-            var deadline = DateTime.UtcNow.AddMinutes(config.TimeoutMinutes);
-            var continuations = 0;
-            while (true)
-            {
-                Task tick = Task.Delay(TimeSpan.FromSeconds(config.CancelCheckSeconds), CancellationToken.None);
-                Task exited = agent.WaitForExitAsync();
-                var stopped = Task.Delay(Timeout.Infinite, ct);
-                var first = await Task.WhenAny(exited, tick, stopped);
-                RecordSession();
-
-                if (first == stopped)
-                {
-                    // The service is being restarted or the computer shut down: keep the run, resume it on the next start.
-                    agent.Kill();
-                    SaveSession();
-                    Log.Info($"{run.IssueKey}: the runner was stopped - {codingAgent.Name} stopped; run {run.Id} stays Working and resumes when the runner starts again.");
-                    return true;
-                }
-
-                if (first == exited)
-                {
-                    var finalState = await GetRunState(run, CancellationToken.None);
-                    Log.Info($"{run.IssueKey}: {codingAgent.Name} exited ({agent.ExitCode}), run {run.Id} is {finalState}. {agent.Summary()}");
-                    if (finalState == AgentRunStates.Working
-                        && agent.HitTurnLimit
-                        && continuations < config.MaxContinuations
-                        && DateTime.UtcNow < deadline
-                        && sessionId is not null)
-                    {
-                        continuations++;
-                        Log.Info($"{run.IssueKey}: out of turns - continuing the session (round {continuations + 1}).");
-                        agent.Dispose();
-                        agent = codingAgent.Resume(apiKey, run.IssueKey, workspace, sessionId, ResumePrompt(run, "You ran out of turns before finishing."), logPath);
-                        continue;
-                    }
-
-                    await Finished(run, workspace, agent, finalState, Branches);
-                    return false;
-                }
-
-                if (DateTime.UtcNow >= deadline)
-                {
-                    agent.Kill();
-                    Log.Info($"{run.IssueKey}: timed out after {config.TimeoutMinutes} min - {codingAgent.Name} killed.");
-                    await Fail(run, $"Timed out after {config.TimeoutMinutes} min", agent.Summary() + Branches());
-                    return false;
-                }
-
-                string? state;
-                try
-                {
-                    state = await GetRunState(run, ct);
-                }
-                catch (Exception e) when (!ct.IsCancellationRequested)
-                {
-                    // A dropped connection mustn't end the run: the agent keeps working, the next check tries again.
-                    Log.Error($"{run.IssueKey}: couldn't check the run ({e.GetType().Name}: {e.Message}) - checking again in {config.CancelCheckSeconds} s.");
+                    continuations++;
+                    Log.Info($"{run.IssueKey}: out of turns - continuing the session (round {continuations + 1}).");
+                    active.Continue(codingAgent.Resume(apiKey, run.IssueKey, workspace, sessionId, ResumePrompt(run, "You ran out of turns before finishing."), logPath));
                     continue;
                 }
 
-                if (state == AgentRunStates.Cancelled)
-                {
-                    agent.Kill();
-                    Log.Info($"{run.IssueKey}: run {run.Id} was cancelled - {codingAgent.Name} killed.");
-                    Branches();
-                    Notifications.Show(config, $"{run.IssueKey} · agent run cancelled", run.IssueTitle, run.IssueUrl);
-                    return false;
-                }
+                await Finished(active, finalState);
+                return false;
+            }
+
+            if (DateTime.UtcNow >= deadline)
+            {
+                await TimeOut(active);
+                return false;
+            }
+
+            if (await IsCancelled(run, ct))
+            {
+                Cancelled(active);
+                return false;
             }
         }
-        finally
+    }
+
+    /// <summary>The service is being restarted or the computer shut down: the run stays Working, to resume on the next start.</summary>
+    private void Stop(ActiveRun active)
+    {
+        active.Agent.Kill();
+        active.SaveSession();
+        Log.Info($"{active.Run.IssueKey}: the runner was stopped - {codingAgent.Name} stopped; run {active.Run.Id} stays Working and resumes when the runner starts again.");
+    }
+
+    private async Task TimeOut(ActiveRun active)
+    {
+        active.Agent.Kill();
+        Log.Info($"{active.Run.IssueKey}: timed out after {config.TimeoutMinutes} min - {codingAgent.Name} killed.");
+        await Fail(active.Run, $"Timed out after {config.TimeoutMinutes} min", active.Agent.Summary() + active.Branches());
+    }
+
+    /// <summary>Whether someone cancelled the run in Boards. A dropped connection mustn't end the run: it's checked again later.</summary>
+    private async Task<bool> IsCancelled(AgentRunSummary run, CancellationToken ct)
+    {
+        try
         {
-            agent.Dispose();
+            return await GetRunState(run, ct) == AgentRunStates.Cancelled;
         }
+        catch (Exception e) when (!ct.IsCancellationRequested)
+        {
+            Log.Error($"{run.IssueKey}: couldn't check the run ({e.GetType().Name}: {e.Message}) - checking again in {config.CancelCheckSeconds} s.");
+            return false;
+        }
+    }
+
+    private void Cancelled(ActiveRun active)
+    {
+        active.Agent.Kill();
+        Log.Info($"{active.Run.IssueKey}: run {active.Run.Id} was cancelled - {codingAgent.Name} killed.");
+        active.Branches();
+        Notifications.Show(config, $"{active.Run.IssueKey} · agent run cancelled", active.Run.IssueTitle, active.Run.IssueUrl);
     }
 
     /// <summary>The prompt that resumes the run's session: why it stopped, and to carry on with the same task.</summary>
@@ -299,37 +283,41 @@ sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codin
     }
 
     /// <summary>The agent exited and the run won't be continued: report it as it ended.</summary>
-    private async Task Finished(AgentRunSummary run, Workspace workspace, AgentProcess agent, string? finalState, Func<string> branches)
+    private async Task Finished(ActiveRun active, string? finalState)
     {
+        var run = active.Run;
+        var agent = active.Agent;
         if (finalState == AgentRunStates.Working)
         {
-            await Fail(run, $"{codingAgent.Name} stopped without finishing", $"Exit code {agent.ExitCode}. {agent.Summary()}" + branches());
+            await Fail(run, $"{codingAgent.Name} stopped without finishing", $"Exit code {agent.ExitCode}. {agent.Summary()}" + active.Branches());
+            return;
         }
-        else if (finalState is AgentRunStates.Done or AgentRunStates.Failed)
-        {
-            var branchesText = branches();
-            var published = finalState == AgentRunStates.Done ? Publisher.Publish(config, run, workspace) : [];
-            var publishedText = published.Count == 0 ? "" : "\n\nPublished:\n" + string.Join("\n", published.Select(x => $"- {x.Line}"));
 
-            // The agent can't know what it cost; the runner adds it under the agent's own summary.
-            await boards.CreateComment(run.IssueKey, $"_laraue-boards-agent: {agent.Summary()}_" + branchesText + publishedText, CancellationToken.None);
-            if (finalState == AgentRunStates.Done)
-            {
-                var pullRequest = published.Select(x => x.PullRequestUrl).OfType<string>().FirstOrDefault();
-                Notifications.Show(
-                    config,
-                    $"{run.IssueKey} · ready for review",
-                    pullRequest is null ? run.IssueTitle : $"{run.IssueTitle} - {pullRequest}",
-                    run.IssueUrl);
-            }
-            else
-            {
-                Notifications.Show(config, $"{run.IssueKey} · agent failed", run.FailureReason ?? run.IssueTitle, run.IssueUrl);
-            }
+        if (finalState is not (AgentRunStates.Done or AgentRunStates.Failed))
+        {
+            // Cancelled meanwhile, or no longer the issue's latest run: nothing to report.
+            active.Branches();
+            return;
+        }
+
+        var branchesText = active.Branches();
+        var published = finalState == AgentRunStates.Done ? Publisher.Publish(config, run, active.Workspace) : [];
+        var publishedText = published.Count == 0 ? "" : "\n\nPublished:\n" + string.Join("\n", published.Select(x => $"- {x.Line}"));
+
+        // The agent can't know what it cost; the runner adds it under the agent's own summary.
+        await boards.CreateComment(run.IssueKey, $"_laraue-boards-agent: {agent.Summary()}_" + branchesText + publishedText, CancellationToken.None);
+        if (finalState == AgentRunStates.Done)
+        {
+            var pullRequest = published.Select(x => x.PullRequestUrl).OfType<string>().FirstOrDefault();
+            Notifications.Show(
+                config,
+                $"{run.IssueKey} · ready for review",
+                pullRequest is null ? run.IssueTitle : $"{run.IssueTitle} - {pullRequest}",
+                run.IssueUrl);
         }
         else
         {
-            branches();
+            Notifications.Show(config, $"{run.IssueKey} · agent failed", run.FailureReason ?? run.IssueTitle, run.IssueUrl);
         }
     }
 

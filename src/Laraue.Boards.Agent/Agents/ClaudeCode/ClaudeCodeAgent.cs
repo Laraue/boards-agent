@@ -97,14 +97,14 @@ sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
     {
         var info = Info(apiKey, run.IssueKey, workspace);
         AddArguments(info, ["-p", CodingAgents.Prompt("boards-agent:work-on-issue", run, workspace), .. Unattended(), .. Common(run.IssueKey, workspace)]);
-        return new ClaudeCodeProcess(AgentProcess.Launch(info), logPath);
+        return new AgentProcess(AgentProcess.Launch(info), logPath, new ClaudeCodeOutput());
     }
 
     public AgentProcess Resume(string apiKey, string issueKey, Workspace workspace, string sessionId, string instruction, string logPath)
     {
         var info = Info(apiKey, issueKey, workspace);
         AddArguments(info, ["-p", instruction, "--resume", sessionId, .. Unattended(), .. Common(issueKey, workspace)]);
-        return new ClaudeCodeProcess(AgentProcess.Launch(info), logPath);
+        return new AgentProcess(AgentProcess.Launch(info), logPath, new ClaudeCodeOutput());
     }
 
     public int ResumeInteractive(string apiKey, string issueKey, Workspace workspace, string sessionId, string? context)

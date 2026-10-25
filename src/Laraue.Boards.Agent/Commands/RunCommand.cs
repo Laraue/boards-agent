@@ -41,15 +41,27 @@ static class RunCommand
         Log.Info($"Watching your Ready runs in every space; repositories are looked up under {string.Join(", ", config.CodeFolders)}."
             + (options.DryRun ? " Dry run - nothing is claimed." : $" {codingAgent.Name}: {codingAgent.FindExecutable()}"));
 
-        var spaces = new SpaceResolver(boards, config, new CloneIndex(config.CodeFolders));
         var runner = new Runner(boards, config, codingAgent, apiKey, RunsInProgress.PathFor(options.ConfigPath), options.ConfigPath);
-        // Runs skipped for having no repository here, so each is logged once rather than every poll.
-        var skippedRuns = new HashSet<long>();
-        // Checkout mode: runs the person said "Not now" to, and when to ask about them again.
-        var postponedRuns = new Dictionary<long, DateTime>();
-        // Boards not answering (a dropped connection, a deploy) is logged and retried at the next poll. Several failures in a row
-        // end the process, so the service restarts it with a fresh connection - an MCP session doesn't survive a server restart.
-        const int MaxFailuresInARow = 5;
+        var poller = new ReadyRunPoller(
+            boards,
+            config,
+            new SpaceResolver(boards, config, new CloneIndex(config.CodeFolders)),
+            runner,
+            me.User.Id,
+            options.DryRun);
+        return await PollUntilStopped(poller, config, options.Once, ct);
+    }
+
+    /// <summary>
+    /// Boards not answering (a dropped connection, a deploy) is logged and retried at the next poll. Several failures in a
+    /// row end the process, so the service restarts it with a fresh connection - an MCP session doesn't survive a server
+    /// restart.
+    /// </summary>
+    private const int MaxFailuresInARow = 5;
+
+    /// <summary>Polls until stopped (or once, with --once); right after a run is worked on, polls again without waiting.</summary>
+    private static async Task<int> PollUntilStopped(ReadyRunPoller poller, RunnerConfig config, bool once, CancellationToken ct)
+    {
         var failuresInARow = 0;
         try
         {
@@ -58,55 +70,7 @@ static class RunCommand
                 var worked = false;
                 try
                 {
-                    if (!options.DryRun)
-                    {
-                        await runner.RecoverInterruptedRun(ct);
-                    }
-
-                    var runs = await boards.ListReadyRuns(spaceKey: null, me.User.Id, ct);
-                    var resolved = new Dictionary<string, SpaceContext>();
-                    foreach (var run in runs)
-                    {
-                        var spaceKey = IssueKeys.SpaceKey(run.IssueKey);
-                        if (!resolved.TryGetValue(spaceKey, out var space))
-                        {
-                            space = await spaces.Resolve(spaceKey, ct);
-                            resolved[spaceKey] = space;
-                        }
-
-                        if (space.Repos.Count == 0)
-                        {
-                            if (skippedRuns.Add(run.Id))
-                            {
-                                var links = space.OtherLinks.Count == 0 ? "the space has no links" : $"links: {string.Join(", ", space.OtherLinks.Select(x => x.Url))}";
-                                Log.Info($"{run.IssueKey}: Ready, but none of {spaceKey}'s repositories is cloned under {string.Join(", ", config.CodeFolders)} ({links}) - left for another machine.");
-                            }
-
-                            continue;
-                        }
-
-                        if (postponedRuns.TryGetValue(run.Id, out var askAgainAt) && DateTime.UtcNow < askAgainAt)
-                        {
-                            continue;
-                        }
-
-                        Log.Info($"{spaceKey}: Ready run {run.Id} for {run.IssueKey} \"{run.IssueTitle}\" (handed off by {run.CreatedBy} at {run.CreatedAt:u}), repositories: {string.Join(", ", space.Repos.Select(x => x.Name))}.");
-                        if (!options.DryRun && config.InCheckouts && !CheckoutsReady(space, run))
-                        {
-                            postponedRuns[run.Id] = DateTime.UtcNow.AddMinutes(10);
-                            Log.Info($"{run.IssueKey}: not now - asking again in 10 minutes.");
-                            continue;
-                        }
-
-                        postponedRuns.Remove(run.Id);
-                        if (!options.DryRun && await runner.TryProcess(space, run, ct))
-                        {
-                            // One run at a time: poll again from the start once it's over.
-                            worked = true;
-                            break;
-                        }
-                    }
-
+                    worked = await poller.PollOnce(ct);
                     failuresInARow = 0;
                 }
                 catch (Exception e) when (!ct.IsCancellationRequested)
@@ -121,7 +85,7 @@ static class RunCommand
                     Log.Error($"Couldn't reach Boards ({e.GetType().Name}: {e.Message}) - trying again in {config.PollIntervalSeconds} s.");
                 }
 
-                if (options.Once)
+                if (once)
                 {
                     break;
                 }
@@ -138,36 +102,5 @@ static class RunCommand
 
         Log.Info("Stopped.");
         return 0;
-    }
-
-    // Checkout mode: true once no clone of the space has uncommitted changes - the one case where switching branches could
-    // carry or clash with the person's work, so it's asked about; they're never touched, and "Continue" with changes still
-    // there asks again. A clean clone on another branch (e.g. the previous issue's, under review) is just switched: its
-    // commits stay on that branch.
-    private static bool CheckoutsReady(SpaceContext space, AgentRunSummary run)
-    {
-        while (true)
-        {
-            var problems = Checkouts.Problems(space, WorkspaceManager.BranchName(space, run.IssueKey, run.IssueTitle))
-                .Where(x => x.HasChanges)
-                .ToList();
-            if (problems.Count == 0)
-            {
-                return true;
-            }
-
-            Log.Info($"{run.IssueKey}: asking before switching the clones - {string.Join("; ", problems.Select(x => x.Text))}.");
-            var message = $"""
-                {run.IssueKey} "{run.IssueTitle}" is ready for the agent, which will work in your clones on branch {WorkspaceManager.BranchName(space, run.IssueKey, run.IssueTitle)}.
-
-                {string.Join("\n", problems.Select(x => x.Text))}
-
-                Commit or stash the changes first - they're never touched. Continue?
-                """;
-            if (!UserPrompt.Ask(message, yes: "Continue", no: "Not now"))
-            {
-                return false;
-            }
-        }
     }
 }
