@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <!-- The binary and its process name: laraue-boards-agent, with lba as a link to it (install scripts). -->
+        <AssemblyName>laraue-boards-agent</AssemblyName>
+        <RootNamespace>Laraue.Boards.Agent</RootNamespace>
+        <!-- Self-contained single-file releases, trimmed; JSON goes through the source generator (RunnerJson) only. -->
+        <PublishTrimmed>true</PublishTrimmed>
+        <JsonSerializerIsReflectionEnabledByDefault>false</JsonSerializerIsReflectionEnabledByDefault>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="ModelContextProtocol.Core" Version="1.4.0" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <!-- The agent skill ships inside the runner: it writes it out and passes it to Claude Code as a plugin directory. -->
+        <EmbeddedResource Include="plugin/**/*" LogicalName="plugin/%(RecursiveDir)%(Filename)%(Extension)" />
+        <!-- The icon of the macOS notification app (laraue-boards-agent.app): the Laraue logo. -->
+        <EmbeddedResource Include="assets/icon.png" LogicalName="assets/icon.png" />
+    </ItemGroup>
+
+</Project>

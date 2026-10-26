@@ -131,9 +131,13 @@ Push a `v*` tag (e.g. `v0.1.0`; `v0.1.0-beta.1` makes a pre-release). The Releas
 You need the .NET 10 SDK and Claude Code (on `PATH`, or the copy bundled with the Claude desktop app) or Codex (on `PATH`).
 
 ```bash
-dotnet run boards-agent.cs -- setup
-dotnet run boards-agent.cs
+dotnet run --project src/Laraue.Boards.Agent -- setup
+dotnet run --project src/Laraue.Boards.Agent
 ```
+
+The runner is `src/Laraue.Boards.Agent` (the work-on-issue skill in `plugin/` and the notification icon in `assets/` are embedded in it); `boards-agent.slnx` opens it in an IDE.
+
+The tests are in `tests/Laraue.Boards.Agent.Tests` (xunit, Moq) and need only git: `dotnet test`.
 
 Against a local Boards, point setup at it: `--web-url http://localhost:3000 --api-url http://localhost:5200 --mcp-url http://localhost:5202/mcp`.
 

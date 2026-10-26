@@ -1,0 +1,33 @@
+using Laraue.Boards.Agent.Infrastructure;
+using Laraue.Boards.Agent.Tests.TestSupport;
+
+namespace Laraue.Boards.Agent.Tests.Workspaces;
+
+public class GitCommitsSinceTests : IDisposable
+{
+    private readonly TestGit _git = new();
+
+    [Fact]
+    public void CommitsSince_ShouldCountTheBranchNotHead_WhenAnotherBranchIsCheckedOut()
+    {
+        var baseCommit = _git.Head(_git.Clone);
+        _git.Run(_git.Clone, "switch", "-c", "agent/BRD-1-x");
+        _git.Commit(_git.Clone, "a.txt", "a");
+        _git.Run(_git.Clone, "switch", "-c", "mine", baseCommit);
+        _git.Commit(_git.Clone, "b.txt", "b");
+        _git.Commit(_git.Clone, "c.txt", "c");
+
+        Assert.Equal(1, Git.CommitsSince(_git.Clone, baseCommit, "agent/BRD-1-x"));
+    }
+
+    [Fact]
+    public void CommitsSince_ShouldBeMinusOne_WhenTheBranchDoesntExist()
+    {
+        Assert.Equal(-1, Git.CommitsSince(_git.Clone, _git.Head(_git.Clone), "agent/BRD-1-deleted"));
+    }
+
+    public void Dispose()
+    {
+        _git.Dispose();
+    }
+}

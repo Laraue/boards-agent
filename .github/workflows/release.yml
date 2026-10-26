@@ -9,7 +9,12 @@ permissions:
   contents: write
 
 jobs:
+  # A tag doesn't publish binaries that fail the tests.
+  test:
+    uses: ./.github/workflows/dotnet.yml
+
   build:
+    needs: test
     strategy:
       matrix:
         include:
@@ -35,14 +40,13 @@ jobs:
       - name: Publish
         run: |
           version="${GITHUB_REF_NAME#v}"
-          dotnet publish boards-agent.cs \
+          dotnet publish src/Laraue.Boards.Agent/Laraue.Boards.Agent.csproj \
             -r ${{ matrix.rid }} \
             --self-contained \
             -p:PublishSingleFile=true \
             -p:EnableCompressionInSingleFile=true \
             -p:DebugType=none \
             -p:Version="$version" \
-            -p:AssemblyName=laraue-boards-agent \
             -o out/laraue-boards-agent
 
       - name: Package
