@@ -143,6 +143,12 @@ public sealed record RunnerConfig
     /// </summary>
     public bool Chrome { get; set; }
 
+    /// <summary>
+    /// Whether the background service looks for a new release once a day and says so (a notification and the log). It
+    /// never updates by itself: `lba update` does.
+    /// </summary>
+    public bool CheckForUpdates { get; set; } = true;
+
     /// <summary>How often Ready runs are polled.</summary>
     public int PollIntervalSeconds { get; set; } = 60;
 

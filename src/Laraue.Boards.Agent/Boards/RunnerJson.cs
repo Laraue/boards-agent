@@ -4,6 +4,7 @@ using Laraue.Boards.Agent.Agents;
 using Laraue.Boards.Agent.Agents.ClaudeCode;
 using Laraue.Boards.Agent.Config;
 using Laraue.Boards.Agent.Runs;
+using Laraue.Boards.Agent.Updates;
 
 namespace Laraue.Boards.Agent.Boards;
 
@@ -15,6 +16,7 @@ namespace Laraue.Boards.Agent.Boards;
     WriteIndented = true,
     DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull)]
 [JsonSerializable(typeof(RunnerConfig))]
+[JsonSerializable(typeof(UpdateCheckState))]
 [JsonSerializable(typeof(IReadOnlyList<SpaceSummary>))]
 [JsonSerializable(typeof(SpaceDetail))]
 [JsonSerializable(typeof(ClaudeAuthStatus))]

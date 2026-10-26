@@ -31,6 +31,8 @@ Solution: `boards-agent.slnx`.
   - `Publishing` - `Publisher` (push, `gh pr create`), `PullRequestReviews` (review comments for re-runs).
   - `Boards` - `IBoardsClient`/`BoardsClient` (MCP), the DTOs, `RunnerJson`, sign-in and the credential store.
   - `Config` - `RunnerConfig` and its value sets (`PublishModes`, `WorkspaceModes`, `ReviewCommentLevels`).
+  - `Updates` - `lba update` (`Updater`: find, download, verify, unpack, replace the binary) and the service's daily
+    new-version check (`UpdateNotifier`).
   - `Infrastructure` - `Git`, `Shell`, `Notifications`, `Log`, `ConsolePrompt`, `UserPrompt`, Windows helpers.
   - `plugin/` - the `work-on-issue` skill, embedded and passed to Claude Code as a plugin directory (Codex reads the
     same `SKILL.md`). `assets/icon.png` - the notification app's icon, embedded.

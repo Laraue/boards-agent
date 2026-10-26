@@ -33,6 +33,8 @@
   "resolveReviewThreads": false,
   // System notifications (as laraue-boards-agent) when a run starts, is ready for review, fails or is cancelled.
   "notifications": true,
+  // The background service looks for a new release once a day and says so; `lba update` installs it.
+  "checkForUpdates": true,
   // Claude Code only: let interactive `lba continue` sessions use your Chrome (Claude in Chrome); runs never do.
   "chrome": false,
   // The coding agent: "claude" (Claude Code) or "codex" (OpenAI Codex). Setup asks when both are installed.

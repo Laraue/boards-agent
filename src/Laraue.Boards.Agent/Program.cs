@@ -76,6 +76,23 @@ if (options.Command == RunnerArgs.ReviewCommentsCommand)
     }
 }
 
+if (options.Command == RunnerArgs.UpdateCommand)
+{
+    try
+    {
+        return await UpdateCommand.RunAsync(options, stop.Token);
+    }
+    catch (Exception e) when (e is HttpRequestException or InvalidOperationException or IOException or UnauthorizedAccessException)
+    {
+        Console.Error.WriteLine($"Couldn't update: {e.Message}");
+        return 1;
+    }
+    catch (OperationCanceledException) when (stop.IsCancellationRequested)
+    {
+        return 1;
+    }
+}
+
 if (options.Command == RunnerArgs.ContinueCommand)
 {
     try
