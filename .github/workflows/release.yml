@@ -9,7 +9,12 @@ permissions:
   contents: write
 
 jobs:
+  # A tag doesn't publish binaries that fail the tests.
+  test:
+    uses: ./.github/workflows/dotnet.yml
+
   build:
+    needs: test
     strategy:
       matrix:
         include:
