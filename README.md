@@ -93,6 +93,14 @@ The script downloads the newest release for your system, checks it against the r
 
 After setup, you don't run anything: click **Hand to agent** on an issue assigned to you in Boards.
 
+### Update
+
+```bash
+lba update
+```
+
+installs the newest release (pre-releases included) the same way - downloaded for your system, checked against `SHA256SUMS` - in place of the binary you run, and restarts the background service on it. An agent run in progress resumes after the restart. `lba update 0.5.0-beta.2` installs a given version, e.g. to go back. The background service looks for a new release once a day and tells you with a notification; it never updates by itself (`"checkForUpdates": false` turns the check off).
+
 ## Setup
 
 Run `lba setup`, ideally from inside the repository you want the agent to work in. It:

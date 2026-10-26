@@ -23,7 +23,8 @@ public sealed record RunnerArgs(
     string? IssueKey = null,
     string? Instruction = null,
     IReadOnlyList<string>? ReviewCommentsArguments = null,
-    bool ReviewCommentsDefault = false)
+    bool ReviewCommentsDefault = false,
+    string? UpdateVersion = null)
 {
     public const string SetupCommand = "setup";
 
@@ -33,10 +34,13 @@ public sealed record RunnerArgs(
 
     public const string ReviewCommentsCommand = "review-comments";
 
+    public const string UpdateCommand = "update";
+
     private const string Usage =
         "Usage: lba [--config <file>] [--log <file>] [--once] [--dry-run] [--check] [--version]   (or laraue-boards-agent)\n" +
         "       lba setup [--no-browser] [--web-url <url>] [--api-url <url>] [--mcp-url <url>]\n" +
         "       lba continue [issue key] [instruction]\n" +
+        "       lba update [version]\n" +
         "       lba review-comments [[repository] off|owner|collaborators|anyone|default] [--default <level>]\n" +
         "       lba service install|uninstall|restart|status [--config <file>]\n" +
         "       lba status   (the same as lba service status)";
@@ -59,6 +63,7 @@ public sealed record RunnerArgs(
         string? instruction = null;
         var reviewArguments = new List<string>();
         var reviewDefault = false;
+        string? updateVersion = null;
         for (var i = 0; i < args.Length; i++)
         {
             switch (args[i])
@@ -83,6 +88,15 @@ public sealed record RunnerArgs(
                     }
 
                     instruction = words.Count == 0 ? null : string.Join(' ', words);
+
+                    break;
+                case UpdateCommand when i == 0:
+                    command = UpdateCommand;
+                    if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
+                    {
+                        var tag = args[++i];
+                        updateVersion = tag.StartsWith('v') ? tag : $"v{tag}";
+                    }
 
                     break;
                 case ReviewCommentsCommand when i == 0:
@@ -167,6 +181,7 @@ public sealed record RunnerArgs(
             issueKey,
             instruction,
             reviewArguments,
-            reviewDefault);
+            reviewDefault,
+            updateVersion);
     }
 }

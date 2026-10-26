@@ -139,7 +139,7 @@ public static class Service
     }
 
     /// <summary>Whether the installed service starts <paramref name="executable"/>.</summary>
-    private static bool RegisteredFor(string executable)
+    public static bool RegisteredFor(string executable)
     {
         var definition = OperatingSystem.IsWindows()
             ? Shell.Run("schtasks", "/Query", "/TN", TaskName, "/XML").Output
@@ -193,13 +193,19 @@ public static class Service
     /// The binary to start: Homebrew's version-free link rather than the versioned Cellar path, so the service survives
     /// `brew upgrade`. Null when the runner runs as `dotnet run` rather than as a binary.
     /// </summary>
-    private static string? StableExecutablePath()
+    /// <summary>
+    /// The installed binary this process runs from, links resolved (lba is a link to laraue-boards-agent); null when it
+    /// runs from source - through dotnet, or a build output of `dotnet run`.
+    /// </summary>
+    public static string? StableExecutablePath()
     {
         var path = Environment.ProcessPath;
-        // `dotnet run boards-agent.cs` runs either through dotnet or through a build in dotnet's runfile cache.
+        var normalized = path?.Replace('\\', '/');
         if (path is null
             || Path.GetFileNameWithoutExtension(path) == "dotnet"
-            || path.Replace('\\', '/').Contains("/dotnet/runfile/", StringComparison.Ordinal))
+            || normalized!.Contains("/bin/Debug/", StringComparison.Ordinal)
+            || normalized.Contains("/bin/Release/", StringComparison.Ordinal)
+            || normalized.Contains("/dotnet/runfile/", StringComparison.Ordinal))
         {
             return null;
         }

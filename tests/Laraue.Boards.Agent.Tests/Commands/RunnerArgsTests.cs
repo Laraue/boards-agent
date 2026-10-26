@@ -67,6 +67,18 @@ public class RunnerArgsTests
         Assert.Throws<ArgumentException>(() => RunnerArgs.Parse(["review-comments", "acme/api", "owner", "extra"]));
     }
 
+    [Theory]
+    [InlineData(new[] { "update" }, null)]
+    [InlineData(new[] { "update", "0.5.0-beta.2" }, "v0.5.0-beta.2")]
+    [InlineData(new[] { "update", "v0.5.0" }, "v0.5.0")]
+    public void Parse_ShouldTakeTheVersionAsATag_WhenUpdateGetsOne(string[] args, string? expected)
+    {
+        var options = RunnerArgs.Parse(args);
+
+        Assert.Equal(RunnerArgs.UpdateCommand, options.Command);
+        Assert.Equal(expected, options.UpdateVersion);
+    }
+
     [Fact]
     public void Parse_ShouldThrowWithTheUsage_WhenAnArgumentIsUnknown()
     {

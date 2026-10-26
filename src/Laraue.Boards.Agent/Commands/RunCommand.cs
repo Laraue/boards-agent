@@ -3,6 +3,7 @@ using Laraue.Boards.Agent.Boards;
 using Laraue.Boards.Agent.Config;
 using Laraue.Boards.Agent.Infrastructure;
 using Laraue.Boards.Agent.Runs;
+using Laraue.Boards.Agent.Updates;
 using Laraue.Boards.Agent.Workspaces;
 
 namespace Laraue.Boards.Agent.Commands;
@@ -49,7 +50,8 @@ public static class RunCommand
             runner,
             me.User.Id,
             options.DryRun);
-        return await PollUntilStopped(poller, config, options.Once, ct);
+        var updates = new UpdateNotifier(new Updater(new HttpClient()), config, UpdateNotifier.PathFor(options.ConfigPath), RunnerVersion.Value, TimeProvider.System);
+        return await PollUntilStopped(poller, updates, config, options.Once, ct);
     }
 
     /// <summary>
@@ -60,7 +62,7 @@ public static class RunCommand
     private const int MaxFailuresInARow = 5;
 
     /// <summary>Polls until stopped (or once, with --once); right after a run is worked on, polls again without waiting.</summary>
-    private static async Task<int> PollUntilStopped(ReadyRunPoller poller, RunnerConfig config, bool once, CancellationToken ct)
+    private static async Task<int> PollUntilStopped(ReadyRunPoller poller, UpdateNotifier updates, RunnerConfig config, bool once, CancellationToken ct)
     {
         var failuresInARow = 0;
         try
@@ -89,6 +91,8 @@ public static class RunCommand
                 {
                     break;
                 }
+
+                await updates.CheckIfDue(ct);
 
                 if (!worked)
                 {
