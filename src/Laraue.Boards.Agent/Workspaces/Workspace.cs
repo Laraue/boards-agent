@@ -14,6 +14,12 @@ public sealed record Workspace(string Path, string Branch, IReadOnlyList<Workspa
     /// <summary>Commits the branch already had when the run started - an earlier run's work this one continues.</summary>
     public int CommitsSoFar { get; init; }
 
+    /// <summary>
+    /// The issue's earlier branch when it was merged already, so this run started a new <see cref="Branch"/> from the base:
+    /// the issue came back after its work shipped.
+    /// </summary>
+    public string? MergedBranch { get; init; }
+
     /// <summary>Open review comments on the branch's pull requests, for a run continuing earlier work (<see cref="PullRequestReviews"/>).</summary>
     public IReadOnlyList<PullRequestReview> Reviews { get; init; } = [];
 
@@ -36,3 +42,7 @@ public sealed record WorkspaceRepo(
     string? Url,
     string? Description,
     string? PreviousBranch = null);
+
+/// <summary>The branch a run of an issue works on (<see cref="WorkspaceManager.ChooseBranch"/>).</summary>
+/// <param name="MergedBranch">The issue's earlier branch, merged already, that <paramref name="Name"/> replaces; null when it continues or starts one.</param>
+public sealed record IssueBranch(string Name, string? MergedBranch);

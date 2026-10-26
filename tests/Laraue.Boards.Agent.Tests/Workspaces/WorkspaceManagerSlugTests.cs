@@ -22,10 +22,10 @@ public class WorkspaceManagerSlugTests
     }
 
     [Fact]
-    public void BranchName_ShouldBeTheKeyAndSlug_WhenNoEarlierBranchExists()
+    public void ChooseBranch_ShouldBeTheKeyAndSlug_WhenTheSpaceHasNoRepositoryWithAnEarlierBranch()
     {
-        var branch = WorkspaceManager.BranchName(TestSupport.TestData.Space(), "BRD-42", "Sort epics");
+        var branch = WorkspaceManager.ChooseBranch(TestSupport.TestData.Space(), "BRD-42", "Sort epics");
 
-        Assert.Equal("agent/BRD-42-sort-epics", branch);
+        Assert.Equal(new IssueBranch("agent/BRD-42-sort-epics", MergedBranch: null), branch);
     }
 }

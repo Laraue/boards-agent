@@ -1,4 +1,5 @@
 using Laraue.Boards.Agent.Infrastructure;
+using Laraue.Boards.Agent.Publishing;
 
 namespace Laraue.Boards.Agent.Workspaces;
 
@@ -8,22 +9,50 @@ public static class WorkspaceManager
     private const int MaxSlugLength = 40;
 
     /// <summary>
-    /// The issue's branch: the one an earlier run left in any of the space's repositories - found by the issue key, so
-    /// renaming the issue doesn't start a new branch - else agent/KEY-slug-of-the-title.
+    /// The issue's branch: the newest one an earlier run left in any of the space's repositories that isn't merged yet -
+    /// found by the issue key, so renaming the issue doesn't start a new branch. When there's none, or every one was
+    /// merged (the issue came back after its work shipped), a new agent/KEY-slug-of-the-title, numbered when that name
+    /// is taken (agent/KEY-slug-2), started from the base.
     /// </summary>
-    public static string BranchName(SpaceContext space, string issueKey, string issueTitle)
+    public static IssueBranch ChooseBranch(SpaceContext space, string issueKey, string issueTitle)
     {
         var prefix = $"agent/{issueKey}";
-        foreach (var repo in space.Repos)
+        var existing = space.Repos
+            .SelectMany(repo => Git.FindBranches(repo.ClonePath, prefix))
+            .Distinct()
+            .ToList();
+        string? merged = null;
+        foreach (var branch in existing)
         {
-            if (Git.FindBranch(repo.ClonePath, prefix) is { } existing)
+            if (!IsMerged(space, branch))
             {
-                return existing;
+                return new IssueBranch(branch, MergedBranch: null);
             }
+
+            merged ??= branch;
         }
 
         var slug = Slug(issueTitle);
-        return slug.Length == 0 ? prefix : $"{prefix}-{slug}";
+        var name = slug.Length == 0 ? prefix : $"{prefix}-{slug}";
+        var free = name;
+        for (var i = 2; space.Repos.Any(repo => Git.BranchExists(repo.ClonePath, free)); i++)
+        {
+            free = $"{name}-{i}";
+        }
+
+        return new IssueBranch(free, merged);
+    }
+
+    /// <summary>
+    /// Whether the branch's work shipped: merged into the base of a repository it has commits in (git), or its pull
+    /// request was merged (GitHub - a squash merge shows only there) - and it isn't still being worked on anywhere.
+    /// </summary>
+    private static bool IsMerged(SpaceContext space, string branch)
+    {
+        var withBranch = space.Repos
+            .Where(repo => Git.FindBranches(repo.ClonePath, branch).Contains(branch))
+            .ToList();
+        return withBranch.Any(repo => Git.IsMergedInto(repo.ClonePath, branch, repo.BaseRef) || GitHub.HasMergedPullRequest(repo.ClonePath, branch));
     }
 
     /// <summary>
@@ -59,13 +88,14 @@ public static class WorkspaceManager
 
     public static Workspace Create(SpaceContext space, string worktreeFolder, string issueKey, string issueTitle)
     {
-        var branch = BranchName(space, issueKey, issueTitle);
+        var issueBranch = ChooseBranch(space, issueKey, issueTitle);
+        var branch = issueBranch.Name;
         var root = Path.Combine(worktreeFolder, issueKey);
         if (space.Repos.Count == 1)
         {
             var repo = space.Repos[0];
             Git.CreateWorktree(repo.ClonePath, repo.BaseRef, root, branch);
-            return WithCommitsSoFar(new Workspace(root, branch, [ToWorkspaceRepo(repo, root)], space, InCheckouts: false));
+            return WithCommitsSoFar(new Workspace(root, branch, [ToWorkspaceRepo(repo, root)], space, InCheckouts: false) { MergedBranch = issueBranch.MergedBranch });
         }
 
         if (File.Exists(Path.Combine(root, ".git")))
@@ -83,7 +113,7 @@ public static class WorkspaceManager
             repos.Add(ToWorkspaceRepo(repo, path));
         }
 
-        return WithCommitsSoFar(new Workspace(root, branch, repos, space, InCheckouts: false));
+        return WithCommitsSoFar(new Workspace(root, branch, repos, space, InCheckouts: false) { MergedBranch = issueBranch.MergedBranch });
     }
 
     /// <summary>
@@ -93,7 +123,8 @@ public static class WorkspaceManager
     /// </summary>
     public static Workspace CreateInCheckouts(SpaceContext space, string issueKey, string issueTitle)
     {
-        var branch = BranchName(space, issueKey, issueTitle);
+        var issueBranch = ChooseBranch(space, issueKey, issueTitle);
+        var branch = issueBranch.Name;
         foreach (var repo in space.Repos)
         {
             // Changes on the issue's own branch are the agent's unfinished work, which this run continues.
@@ -113,7 +144,7 @@ public static class WorkspaceManager
             repos.Add(ToWorkspaceRepo(repo, repo.ClonePath) with { PreviousBranch = previous });
         }
 
-        return WithCommitsSoFar(new Workspace(repos[0].Path, branch, repos, space, InCheckouts: true));
+        return WithCommitsSoFar(new Workspace(repos[0].Path, branch, repos, space, InCheckouts: true) { MergedBranch = issueBranch.MergedBranch });
     }
 
     /// <summary>The workspace with <see cref="Workspace.CommitsSoFar"/>: what an earlier run of the issue left on its branch.</summary>

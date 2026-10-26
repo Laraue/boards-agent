@@ -93,6 +93,11 @@ public static class CodingAgents
             lines.Add($"- Branch: {workspace.Branch}, started from {repo.BaseRef}{Describe(repo.Url, repo.Description)}");
         }
 
+        if (workspace.MergedBranch is { } merged)
+        {
+            lines.Add($"- The issue's earlier branch, {merged}, was merged already, so this is a new branch from {workspace.BaseRef}: the issue came back for more. Do what the issue and its latest comments ask now, on top of what was merged.");
+        }
+
         if (workspace.CommitsSoFar > 0)
         {
             lines.Add($"- This continues earlier work: the branch already has {workspace.CommitsSoFar} commit{(workspace.CommitsSoFar == 1 ? "" : "s")} from a previous run of this issue. Read them (git log, git show) and the comments since, and continue from there - don't start over.");

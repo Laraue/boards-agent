@@ -34,6 +34,16 @@ public class CodingAgentsPromptTests
     }
 
     [Fact]
+    public void Prompt_ShouldSayTheEarlierWorkWasMerged_WhenTheRunStartedANewBranch()
+    {
+        var workspace = TestData.Workspace(TestData.Repo()) with { MergedBranch = "agent/BRD-42-old" };
+
+        var prompt = CodingAgents.Prompt("work-on-issue", TestData.Run(), workspace);
+
+        Assert.Contains("The issue's earlier branch, agent/BRD-42-old, was merged already, so this is a new branch from origin/main", prompt);
+    }
+
+    [Fact]
     public void Prompt_ShouldQuoteReviewCommentsAsData_WhenThePullRequestHasThem()
     {
         var review = new PullRequestReview(

@@ -145,6 +145,10 @@ public sealed class Runner(IBoardsClient boards, RunnerConfig config, ICodingAge
         {
             where = $"continuing {where} ({workspace.CommitsSoFar} commit{(workspace.CommitsSoFar == 1 ? "" : "s")} so far)";
         }
+        else if (workspace.MergedBranch is { } merged)
+        {
+            where = $"{where}, new from {workspace.BaseRef} since `{merged}` was merged";
+        }
 
         var reviewComments = workspace.Reviews.Sum(x => x.Comments.Count);
         if (reviewComments > 0)

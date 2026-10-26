@@ -13,7 +13,17 @@ public static class Git
     {
         if (Directory.Exists(path))
         {
-            return;
+            if (CurrentBranch(path) == branch)
+            {
+                return;
+            }
+
+            // The issue's earlier worktree, on a branch that was merged meanwhile: this run starts a new branch.
+            if (Run(repo, ["worktree", "remove", path], throwOnError: false) is { ExitCode: not 0 } removal)
+            {
+                throw new InvalidOperationException(
+                    $"{path} is a worktree on another branch that can't be removed ({removal.Error.Trim()}); remove it (git worktree remove) to work on {branch}");
+            }
         }
 
         Directory.CreateDirectory(System.IO.Path.GetDirectoryName(path)!);
@@ -60,10 +70,10 @@ public static class Git
     }
 
     /// <summary>
-    /// The newest local branch named <paramref name="prefix"/> or <paramref name="prefix"/>-something, e.g. an earlier
-    /// run's agent/BRD-314 or agent/BRD-314-sort-epics; null when there's none.
+    /// The local branches named <paramref name="prefix"/> or <paramref name="prefix"/>-something, newest commit first, e.g.
+    /// an earlier run's agent/BRD-314 or agent/BRD-314-sort-epics.
     /// </summary>
-    public static string? FindBranch(string repo, string prefix)
+    public static IReadOnlyList<string> FindBranches(string repo, string prefix)
     {
         var result = Run(
             repo,
@@ -72,8 +82,36 @@ public static class Git
         return result.ExitCode == 0
             ? result.Output
                 .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .FirstOrDefault(x => x == prefix || x.StartsWith($"{prefix}-", StringComparison.Ordinal))
-            : null;
+                .Where(x => x == prefix || x.StartsWith($"{prefix}-", StringComparison.Ordinal))
+                .ToList()
+            : [];
+    }
+
+    /// <summary>Whether <paramref name="branch"/> exists here, or on origin as far as the last fetch knows.</summary>
+    public static bool BranchExists(string repo, string branch)
+    {
+        return Run(repo, ["rev-parse", "--verify", "--quiet", $"refs/heads/{branch}"], throwOnError: false).ExitCode == 0
+            || Run(repo, ["rev-parse", "--verify", "--quiet", $"refs/remotes/origin/{branch}"], throwOnError: false).ExitCode == 0;
+    }
+
+    /// <summary>
+    /// Whether the local <paramref name="branch"/> has commits of its own and all of them are in <paramref name="baseRef"/>,
+    /// fetched first: it was merged (or fast-forwarded). Its own commits are the ones since it was created, by its reflog;
+    /// a branch nobody committed to isn't merged, just empty. A squash merge leaves the branch's commits out of the base,
+    /// so it isn't seen here.
+    /// </summary>
+    public static bool IsMergedInto(string repo, string branch, string baseRef)
+    {
+        FetchRemoteRef(repo, baseRef);
+        if (Run(repo, ["merge-base", "--is-ancestor", $"refs/heads/{branch}", baseRef], throwOnError: false).ExitCode != 0)
+        {
+            return false;
+        }
+
+        var created = Run(repo, ["reflog", "show", "--format=%H", $"refs/heads/{branch}"], throwOnError: false).Output
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .LastOrDefault();
+        return created != ResolveCommit(repo, $"refs/heads/{branch}");
     }
 
     /// <summary>

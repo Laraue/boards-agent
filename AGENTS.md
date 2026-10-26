@@ -75,6 +75,10 @@ The runner works unattended on someone's computer, with their API key. Keep thes
 - **Count an agent branch's commits on the branch, not HEAD** (`Git.CommitsSince(repo, base, branch)`). In checkout
   mode `WorkspaceManager.Finish` switches an unchanged clone back to the person's branch and deletes the empty agent
   branch; anything counting HEAD afterwards sees the person's commits.
+- **An issue's branch is reused only while it isn't merged** (`WorkspaceManager.ChooseBranch`). Merged means its own
+  commits are in the fetched base (`Git.IsMergedInto`; "own" is by the branch's reflog, so an empty branch isn't
+  merged) or its newest pull request was merged (`GitHub.HasMergedPullRequest`, for squash merges). Then a new
+  numbered branch starts from the base, and the prompt and the pick-up comment say so.
 - **`RunnerConfig` properties are settable, not `init`**: the source generator would set a missing `init` property to
   null/0, so an older config file would lose the default. A new setting also goes in `boards-agent.example.json`, the
   README, `RunnerConfig.Load`'s validation if it has a fixed set of values, and setup if the person should choose it.
