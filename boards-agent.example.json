@@ -28,6 +28,9 @@
   "repositoryReviewComments": {
     "github.com/acme/internal-api": "anyone"
   },
+  // After pushing a re-run's commits, boards-agent replies in each review thread with what the agent did. true also
+  // resolves a thread whose every comment was fixed; by default the reviewer does.
+  "resolveReviewThreads": false,
   // System notifications (as laraue-boards-agent) when a run starts, is ready for review, fails or is cancelled.
   "notifications": true,
   // Claude Code only: let interactive `lba continue` sessions use your Chrome (Claude in Chrome); runs never do.

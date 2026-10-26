@@ -27,6 +27,18 @@ public class PickUpCommentTests
     }
 
     [Fact]
+    public void PickUpComment_ShouldSayItStartedANewBranch_WhenTheEarlierOneWasMerged()
+    {
+        var workspace = TestData.Workspace(TestData.Repo()) with { MergedBranch = "agent/BRD-42-old" };
+
+        var comment = Runner.PickUpComment(workspace, "dev-laptop");
+
+        Assert.Equal(
+            "laraue-boards-agent picked this up on dev-laptop, branch `agent/BRD-42-sort-epics`, new from origin/main since `agent/BRD-42-old` was merged.",
+            comment);
+    }
+
+    [Fact]
     public void PickUpComment_ShouldSayWhatItContinuesAndWhichReviewsItGot_WhenTheBranchHasEarlierWork()
     {
         var review = new PullRequestReview(

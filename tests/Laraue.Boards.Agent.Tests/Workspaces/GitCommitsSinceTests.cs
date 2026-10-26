@@ -26,6 +26,27 @@ public class GitCommitsSinceTests : IDisposable
         Assert.Equal(-1, Git.CommitsSince(_git.Clone, _git.Head(_git.Clone), "agent/BRD-1-deleted"));
     }
 
+    [Fact]
+    public void PushedCommit_ShouldBeTheBranchesCommit_WhenOriginHasIt()
+    {
+        _git.Run(_git.Clone, "switch", "-c", "agent/BRD-1-x");
+        _git.Commit(_git.Clone, "a.txt", "a");
+        _git.Run(_git.Clone, "push", "origin", "agent/BRD-1-x");
+
+        Assert.Equal(_git.Head(_git.Clone), Git.PushedCommit(_git.Clone, "agent/BRD-1-x"));
+    }
+
+    [Fact]
+    public void PushedCommit_ShouldBeNull_WhenTheBranchHasCommitsOriginDoesnt()
+    {
+        _git.Run(_git.Clone, "switch", "-c", "agent/BRD-1-x");
+        _git.Commit(_git.Clone, "a.txt", "a");
+        _git.Run(_git.Clone, "push", "origin", "agent/BRD-1-x");
+        _git.Commit(_git.Clone, "b.txt", "b");
+
+        Assert.Null(Git.PushedCommit(_git.Clone, "agent/BRD-1-x"));
+    }
+
     public void Dispose()
     {
         _git.Dispose();

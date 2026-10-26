@@ -2,7 +2,7 @@
 
 Hand a [Laraue Boards](https://boards.laraue.com) issue to a coding agent - Claude Code or OpenAI Codex - running on your own machine. The command is `laraue-boards-agent`, or `lba` for short (before 0.4 it was `boards-agent`, which an update keeps as a link).
 
-You click **Hand to agent** on an issue assigned to you. boards-agent, running on your computer with your API key, picks the issue up. It puts the work on branch `agent/<KEY>-<title>` (e.g. `agent/BRD-314-sort-epics-in-space-detail-page`; a re-run of the issue reuses its branch even if the issue was renamed) - in a separate git worktree, or in your own clone if you prefer (see [Where the agent works](#where-the-agent-works)) - and runs the agent there. When the agent is done, the issue is in Review with a summary of what changed, and you get a notification. By default nothing is pushed: you review the branch and push it yourself - or let boards-agent push it and open a pull request (see [When the agent is done](#when-the-agent-is-done)).
+You click **Hand to agent** on an issue assigned to you. boards-agent, running on your computer with your API key, picks the issue up. It puts the work on branch `agent/<KEY>-<title>` (e.g. `agent/BRD-314-sort-epics-in-space-detail-page`; a re-run of the issue reuses its branch even if the issue was renamed - unless that branch was merged meanwhile: then the issue came back for more, and it starts a new branch from the default one, e.g. `agent/BRD-314-sort-epics-...-2`) - in a separate git worktree, or in your own clone if you prefer (see [Where the agent works](#where-the-agent-works)) - and runs the agent there. When the agent is done, the issue is in Review with a summary of what changed, and you get a notification. By default nothing is pushed: you review the branch and push it yourself - or let boards-agent push it and open a pull request (see [When the agent is done](#when-the-agent-is-done)).
 
 ## How it works
 
@@ -52,6 +52,8 @@ Setup asks; the `workspace` setting in the config holds the answer.
   lba review-comments --default owner      # the default level
   ```
   The level stays in this computer's config, not in Boards: it protects the computer the agent runs on, so nobody else can raise it. The runner reads it at each run, so a change needs no restart.
+
+  Once the new commits are pushed, boards-agent answers on the pull request, as you (with your `gh` sign-in): a reply in each review thread with what the agent did - "fixed - moved the check into EpicStatusService", or why it left something as it is - and one comment for the review summaries and other comments. Threads stay open for the reviewer to resolve; with `"resolveReviewThreads": true` boards-agent resolves a thread whose every comment was fixed. The agent itself still never writes to GitHub.
 - **Feedback, right here: `lba continue`.** Opens the agent's session of an issue in your terminal - the same Claude Code or Codex conversation, with everything it knew, in the same repositories and on the issue's branch. Talk to it ("the button is still blue", "add a test"), see the changes and run the app straight away: no hand-off in Boards, no waiting.
   ```bash
   lba continue                              # the issue of the branch you're on, else your agent's last run

@@ -9,10 +9,18 @@ namespace Laraue.Boards.Agent.Publishing;
 /// <summary>A pull request of the issue's branch with its open review comments.</summary>
 /// <param name="Level">Whose comments were kept, a <see cref="ReviewCommentLevels"/> value.</param>
 /// <param name="Skipped">Open comments left out because their authors aren't trusted at <paramref name="Level"/>.</param>
-public sealed record PullRequestReview(string Url, IReadOnlyList<PullRequestReviewComment> Comments, string Level, int Skipped);
+public sealed record PullRequestReview(string Url, IReadOnlyList<PullRequestReviewComment> Comments, string Level, int Skipped)
+{
+    /// <summary>The checkout of the repository the pull request is in, where gh runs to reply (<see cref="ReviewReplies"/>).</summary>
+    public string? RepoPath { get; init; }
+}
 
 /// <param name="Where">The file and line of a line comment ("src/Api.cs:42"), or "review" / "comment" for the rest.</param>
-public sealed record PullRequestReviewComment(string Where, string Author, string Body);
+/// <param name="ThreadId">The review thread a line comment is in, to reply to; null for review summaries and conversation comments.</param>
+public sealed record PullRequestReviewComment(string Where, string Author, string Body, string? ThreadId = null);
+
+/// <summary>A review comment with the reference the prompt gives it (R1, R2...), which the agent's outcome lines use.</summary>
+public sealed record NumberedReviewComment(string Ref, PullRequestReview Review, PullRequestReviewComment Comment);
 
 /// <summary>
 /// The open review comments on the issue branch's pull requests, read with the GitHub CLI by the runner - the agent can't
@@ -37,7 +45,7 @@ public static class PullRequestReviews
                 url
                 commits(last: 1) { nodes { commit { committedDate } } }
                 reviewThreads(first: 100) {
-                  nodes { isResolved path line originalLine comments(first: 50) { nodes { author { login } authorAssociation body } } }
+                  nodes { id isResolved path line originalLine comments(first: 50) { nodes { author { login } authorAssociation body } } }
                 }
                 reviews(last: 50) { nodes { author { login } authorAssociation body submittedAt } }
                 comments(last: 50) { nodes { author { login } authorAssociation body createdAt } }
@@ -78,7 +86,7 @@ public static class PullRequestReviews
             {
                 if (Parse(result.Output, level) is { } review && (review.Comments.Count > 0 || review.Skipped > 0))
                 {
-                    reviews.Add(review);
+                    reviews.Add(review with { RepoPath = repo.Path });
                 }
             }
             catch (Exception e) when (e is JsonException or InvalidOperationException or KeyNotFoundException)
@@ -89,6 +97,17 @@ public static class PullRequestReviews
 
         return reviews;
     }
+
+    /// <summary>Every review comment of <paramref name="reviews"/> with its reference: R1, R2... in order.</summary>
+    public static IReadOnlyList<NumberedReviewComment> Numbered(IReadOnlyList<PullRequestReview> reviews)
+    {
+        return reviews
+            .SelectMany(review => review.Comments.Select(comment => new { Review = review, Comment = comment }))
+            .Select((x, i) => new NumberedReviewComment($"R{i + 1}", x.Review, x.Comment))
+            .ToList();
+    }
+
+    private sealed record OpenComment(string Where, string? ThreadId, JsonElement Comment);
 
     public static PullRequestReview? Parse(string json, string level)
     {
@@ -108,7 +127,7 @@ public static class PullRequestReviews
             ? commits[0].GetProperty("commit").GetProperty("committedDate").GetDateTimeOffset()
             : DateTimeOffset.MinValue;
 
-        var open = new List<(string Where, JsonElement Comment)>();
+        var open = new List<OpenComment>();
         foreach (var thread in pullRequest.GetProperty("reviewThreads").GetProperty("nodes").EnumerateArray())
         {
             if (thread.GetProperty("isResolved").GetBoolean())
@@ -118,12 +137,13 @@ public static class PullRequestReviews
 
             var line = Number(thread, "line") ?? Number(thread, "originalLine");
             var where = $"{thread.GetProperty("path").GetString()}{(line is null ? "" : $":{line}")}";
+            var threadId = thread.TryGetProperty("id", out var id) ? id.GetString() : null;
             // A thread is its first comment and the replies to it.
-            open.AddRange(thread.GetProperty("comments").GetProperty("nodes").EnumerateArray().Select(comment => (where, comment)));
+            open.AddRange(thread.GetProperty("comments").GetProperty("nodes").EnumerateArray().Select(comment => new OpenComment(where, threadId, comment)));
         }
 
-        open.AddRange(Newer(pullRequest.GetProperty("reviews"), "submittedAt", lastCommitAt).Select(x => ("review", x)));
-        open.AddRange(Newer(pullRequest.GetProperty("comments"), "createdAt", lastCommitAt).Select(x => ("comment", x)));
+        open.AddRange(Newer(pullRequest.GetProperty("reviews"), "submittedAt", lastCommitAt).Select(x => new OpenComment("review", null, x)));
+        open.AddRange(Newer(pullRequest.GetProperty("comments"), "createdAt", lastCommitAt).Select(x => new OpenComment("comment", null, x)));
 
         var withText = open
             .Where(x => !string.IsNullOrWhiteSpace(x.Comment.GetProperty("body").GetString()))
@@ -135,7 +155,7 @@ public static class PullRequestReviews
             pullRequest.GetProperty("url").GetString()!,
             trusted
                 .Take(MaxComments)
-                .Select(x => Comment(x.Where, x.Comment))
+                .Select(x => Comment(x.Where, x.ThreadId, x.Comment))
                 .ToList(),
             level,
             withText.Count - trusted.Count);
@@ -160,13 +180,13 @@ public static class PullRequestReviews
                 && date.GetDateTimeOffset() > after);
     }
 
-    private static PullRequestReviewComment Comment(string where, JsonElement comment)
+    private static PullRequestReviewComment Comment(string where, string? threadId, JsonElement comment)
     {
         var author = comment.TryGetProperty("author", out var a) && a.ValueKind == JsonValueKind.Object && a.TryGetProperty("login", out var login)
             ? $"@{login.GetString()}"
             : "unknown";
         var body = (comment.GetProperty("body").GetString() ?? "").Trim();
-        return new PullRequestReviewComment(where, author, body.Length > MaxCommentLength ? body[..MaxCommentLength] + "…" : body);
+        return new PullRequestReviewComment(where, author, body.Length > MaxCommentLength ? body[..MaxCommentLength] + "…" : body, threadId);
     }
 
     private static int? Number(JsonElement element, string name)

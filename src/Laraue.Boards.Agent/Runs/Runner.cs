@@ -145,6 +145,10 @@ public sealed class Runner(IBoardsClient boards, RunnerConfig config, ICodingAge
         {
             where = $"continuing {where} ({workspace.CommitsSoFar} commit{(workspace.CommitsSoFar == 1 ? "" : "s")} so far)";
         }
+        else if (workspace.MergedBranch is { } merged)
+        {
+            where = $"{where}, new from {workspace.BaseRef} since `{merged}` was merged";
+        }
 
         var reviewComments = workspace.Reviews.Sum(x => x.Comments.Count);
         if (reviewComments > 0)
@@ -302,7 +306,8 @@ public sealed class Runner(IBoardsClient boards, RunnerConfig config, ICodingAge
 
         var branchesText = active.Branches();
         var published = finalState == AgentRunStates.Done ? Publisher.Publish(config, run, active.Workspace) : [];
-        var publishedText = published.Count == 0 ? "" : "\n\nPublished:\n" + string.Join("\n", published.Select(x => $"- {x.Line}"));
+        var replies = published.Count == 0 ? [] : ReviewReplies.Post(config, active.Workspace, agent.FinalMessage());
+        var publishedText = published.Count == 0 ? "" : "\n\nPublished:\n" + string.Join("\n", published.Concat(replies.Select(x => new PublishedRepo(x, null))).Select(x => $"- {x.Line}"));
 
         // The agent can't know what it cost; the runner adds it under the agent's own summary.
         await boards.CreateComment(run.IssueKey, $"_laraue-boards-agent: {agent.Summary()}_" + branchesText + publishedText, CancellationToken.None);

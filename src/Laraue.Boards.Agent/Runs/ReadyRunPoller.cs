@@ -99,9 +99,10 @@ public sealed class ReadyRunPoller(
     /// </summary>
     private static bool CheckoutsReady(SpaceContext space, AgentRunSummary run)
     {
+        var branch = WorkspaceManager.ChooseBranch(space, run.IssueKey, run.IssueTitle).Name;
         while (true)
         {
-            var problems = Checkouts.Problems(space, WorkspaceManager.BranchName(space, run.IssueKey, run.IssueTitle))
+            var problems = Checkouts.Problems(space, branch)
                 .Where(x => x.HasChanges)
                 .ToList();
             if (problems.Count == 0)
@@ -111,7 +112,7 @@ public sealed class ReadyRunPoller(
 
             Log.Info($"{run.IssueKey}: asking before switching the clones - {string.Join("; ", problems.Select(x => x.Text))}.");
             var message = $"""
-                {run.IssueKey} "{run.IssueTitle}" is ready for the agent, which will work in your clones on branch {WorkspaceManager.BranchName(space, run.IssueKey, run.IssueTitle)}.
+                {run.IssueKey} "{run.IssueTitle}" is ready for the agent, which will work in your clones on branch {branch}.
 
                 {string.Join("\n", problems.Select(x => x.Text))}
 
