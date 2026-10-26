@@ -158,6 +158,12 @@ public sealed record RunnerConfig
     /// </summary>
     public Dictionary<string, string> RepositoryReviewComments { get; set; } = [];
 
+    /// <summary>
+    /// Whether the runner resolves a review thread after replying that every comment in it was fixed (<see cref="ReviewReplies"/>).
+    /// Off by default: the reviewer resolves it once they've checked the fix.
+    /// </summary>
+    public bool ResolveReviewThreads { get; set; }
+
     /// <summary>The review comments level of the repository with these (normalized) remotes.</summary>
     public string ReviewCommentsFor(IEnumerable<string> remotes)
     {

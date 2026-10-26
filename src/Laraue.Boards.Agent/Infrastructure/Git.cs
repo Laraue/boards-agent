@@ -134,6 +134,16 @@ public static class Git
         return Run(repo, ["push", "--set-upstream", "origin", branch], throwOnError: false);
     }
 
+    /// <summary>
+    /// The commit <paramref name="branch"/> is at when origin has it there too (as the last push or fetch left it), or null
+    /// when it isn't pushed or has commits origin doesn't.
+    /// </summary>
+    public static string? PushedCommit(string repo, string branch)
+    {
+        var local = ResolveCommit(repo, $"refs/heads/{branch}");
+        return local is not null && local == ResolveCommit(repo, $"refs/remotes/origin/{branch}") ? local : null;
+    }
+
     /// <summary>The branch the checkout is on, or null when HEAD is detached.</summary>
     public static string? CurrentBranch(string repo)
     {
