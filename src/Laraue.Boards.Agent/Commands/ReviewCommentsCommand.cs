@@ -12,7 +12,7 @@ namespace Laraue.Boards.Agent.Commands;
 /// and per repository. Kept in this computer's config, not in Boards: it protects the computer the agent runs on, so
 /// nobody else should be able to raise it.
 /// </summary>
-static class ReviewCommentsCommand
+public static class ReviewCommentsCommand
 {
     public const string ResetLevel = "default";
 

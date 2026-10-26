@@ -1,6 +1,6 @@
 namespace Laraue.Boards.Agent.Infrastructure;
 
-static class RunnerVersion
+public static class RunnerVersion
 {
     /// <summary>The version the release was built with (-p:Version), without the source revision suffix.</summary>
     public static readonly string Value =

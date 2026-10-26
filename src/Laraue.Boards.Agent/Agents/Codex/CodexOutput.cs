@@ -8,7 +8,7 @@ namespace Laraue.Boards.Agent.Agents.Codex;
 /// carries the token usage, <c>turn.failed</c> and <c>error</c> what went wrong, and an <c>item.completed</c> of type
 /// <c>agent_message</c> the final answer.
 /// </summary>
-sealed class CodexOutput : AgentOutput
+public sealed class CodexOutput : AgentOutput
 {
     private int _turns;
     private string? _lastMessage;

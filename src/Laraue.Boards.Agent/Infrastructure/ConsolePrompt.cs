@@ -1,7 +1,7 @@
 namespace Laraue.Boards.Agent.Infrastructure;
 
 /// <summary>Questions in the terminal, for setup and the other interactive commands. End of input counts as Enter.</summary>
-static class ConsolePrompt
+public static class ConsolePrompt
 {
     public static string Ask(string question)
     {

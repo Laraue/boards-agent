@@ -8,7 +8,7 @@ namespace Laraue.Boards.Agent.Agents;
 /// issue's worktree with the Boards MCP server. Everything else - polling, claiming, the worktree, cancel and timeout -
 /// doesn't depend on the agent.
 /// </summary>
-interface ICodingAgent
+public interface ICodingAgent
 {
     /// <summary>The config value that picks this agent (<see cref="RunnerConfig.Agent"/>).</summary>
     string Key { get; }

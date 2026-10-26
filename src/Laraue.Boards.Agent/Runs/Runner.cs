@@ -10,7 +10,7 @@ namespace Laraue.Boards.Agent.Runs;
 
 /// <summary>Takes one run from claim to finish.</summary>
 /// <param name="runFilePath">Where the run in progress is recorded (<see cref="RunsInProgress"/>).</param>
-sealed class Runner(BoardsClient boards, RunnerConfig config, ICodingAgent codingAgent, string apiKey, string runFilePath, string configPath)
+public sealed class Runner(IBoardsClient boards, RunnerConfig config, ICodingAgent codingAgent, string apiKey, string runFilePath, string configPath)
 {
     private const int MaxReasonLength = 4096;
 

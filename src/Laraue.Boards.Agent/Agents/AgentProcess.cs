@@ -6,7 +6,7 @@ namespace Laraue.Boards.Agent.Agents;
 /// A running agent working on one run: its process, with stdout and stderr written to the log line by line and stdout
 /// read by the agent's <see cref="AgentOutput"/>.
 /// </summary>
-sealed class AgentProcess : IDisposable
+public sealed class AgentProcess : IDisposable
 {
     private readonly System.Diagnostics.Process _process;
     private readonly StreamWriter _log;

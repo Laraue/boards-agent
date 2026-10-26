@@ -4,7 +4,7 @@ namespace Laraue.Boards.Agent.Infrastructure;
 /// Asks the person a yes/no question: in the terminal when the runner runs in one, else - as a background service - in
 /// a system dialog (macOS, Windows). Without either, the answer is no.
 /// </summary>
-static class UserPrompt
+public static class UserPrompt
 {
     /// <summary>A dialog nobody answers counts as no after this long, so the runner doesn't wait forever.</summary>
     private const int DialogTimeoutSeconds = 600;

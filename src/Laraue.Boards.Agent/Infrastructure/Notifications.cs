@@ -8,7 +8,7 @@ namespace Laraue.Boards.Agent.Infrastructure;
 /// into ~/Applications the first time; clicking one opens that app again, which opens the issue. Windows: a tray
 /// balloon; Linux: notify-send. Best effort: a notification that can't be shown is only logged.
 /// </summary>
-static class Notifications
+public static class Notifications
 {
     public const string AppName = "laraue-boards-agent";
 

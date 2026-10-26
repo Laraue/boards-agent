@@ -3,7 +3,7 @@ using Laraue.Boards.Agent.Infrastructure;
 namespace Laraue.Boards.Agent.Workspaces;
 
 /// <summary>Checkout mode (BRD-313): what has to be asked about before the agent may switch your clones.</summary>
-static class Checkouts
+public static class Checkouts
 {
     /// <summary>
     /// One line per clone that isn't ready to be switched: uncommitted changes, or a branch other than the default one
@@ -55,4 +55,4 @@ static class Checkouts
 }
 
 /// <summary>A clone that isn't ready to be switched. <paramref name="HasChanges"/>: it has uncommitted changes (or git couldn't tell).</summary>
-sealed record CheckoutProblem(string Text, bool HasChanges);
+public sealed record CheckoutProblem(string Text, bool HasChanges);

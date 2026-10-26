@@ -1,7 +1,7 @@
 namespace Laraue.Boards.Agent.Infrastructure;
 
 /// <summary>The system's own folder picker: Finder on macOS, Explorer on Windows.</summary>
-static class FolderPicker
+public static class FolderPicker
 {
     public static bool IsSupported => OperatingSystem.IsMacOS() || OperatingSystem.IsWindows();
 

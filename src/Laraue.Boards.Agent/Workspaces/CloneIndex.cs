@@ -4,13 +4,13 @@ using Laraue.Boards.Agent.Infrastructure;
 namespace Laraue.Boards.Agent.Workspaces;
 
 /// <summary>A git checkout found on this machine, with its remotes' normalized URLs.</summary>
-sealed record LocalClone(string Path, IReadOnlyList<string> Remotes);
+public sealed record LocalClone(string Path, IReadOnlyList<string> Remotes);
 
 /// <summary>
 /// The git checkouts under the configured code folders (up to three levels deep), found again every ten minutes so a
 /// repository cloned meanwhile is picked up. Worktrees are skipped: only main checkouts count.
 /// </summary>
-sealed class CloneIndex(IReadOnlyList<string> codeFolders)
+public sealed class CloneIndex(IReadOnlyList<string> codeFolders)
 {
     private const int MaxDepth = 3;
     private static readonly TimeSpan MaxAge = TimeSpan.FromMinutes(10);

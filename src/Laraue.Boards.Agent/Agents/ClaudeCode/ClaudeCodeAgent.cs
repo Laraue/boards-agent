@@ -9,7 +9,7 @@ using Laraue.Boards.Agent.Workspaces;
 namespace Laraue.Boards.Agent.Agents.ClaudeCode;
 
 /// <summary>Claude Code, in print mode, with the work-on-issue skill as a plugin and only the Boards MCP server.</summary>
-sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
+public sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
 {
     /// <summary>Never allowed, whatever the repository's own settings say.</summary>
     private static readonly string[] DisallowedTools =
@@ -221,4 +221,4 @@ sealed class ClaudeCodeAgent(RunnerConfig config) : ICodingAgent
 }
 
 /// <summary>`claude auth status`'s answer - only what setup reads.</summary>
-sealed record ClaudeAuthStatus(bool LoggedIn);
+public sealed record ClaudeAuthStatus(bool LoggedIn);

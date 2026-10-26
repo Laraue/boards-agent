@@ -7,7 +7,7 @@ using Laraue.Boards.Agent.Workspaces;
 
 namespace Laraue.Boards.Agent.Agents;
 
-static class CodingAgents
+public static class CodingAgents
 {
     public const string Claude = "claude";
 

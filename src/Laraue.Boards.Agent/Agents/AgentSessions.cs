@@ -13,9 +13,9 @@ namespace Laraue.Boards.Agent.Agents;
 /// The run the last `lba continue` started (BRD-320). Still Working next time means that session was cut off (a crash,
 /// a closed terminal), so the next `lba continue` carries on with it instead of starting another.
 /// </param>
-sealed record AgentSession(string IssueKey, string IssueTitle, string IssueUrl, string Agent, string SessionId, RunInProgressWorkspace Workspace, long? ContinueRunId = null);
+public sealed record AgentSession(string IssueKey, string IssueTitle, string IssueUrl, string Agent, string SessionId, RunInProgressWorkspace Workspace, long? ContinueRunId = null);
 
-static class AgentSessions
+public static class AgentSessions
 {
     /// <param name="besidePath">A file next to the config (e.g. the run record's): the sessions folder is beside it.</param>
     public static void Save(string besidePath, AgentSession session)

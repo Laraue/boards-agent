@@ -2,7 +2,7 @@ using Laraue.Boards.Agent.Infrastructure;
 
 namespace Laraue.Boards.Agent.Workspaces;
 
-static class WorkspaceManager
+public static class WorkspaceManager
 {
     /// <summary>How long the title part of a new branch name can get, e.g. agent/BRD-314-sort-epics-in-space-detail-page.</summary>
     private const int MaxSlugLength = 40;

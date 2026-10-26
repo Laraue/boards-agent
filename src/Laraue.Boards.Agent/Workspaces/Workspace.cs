@@ -7,7 +7,7 @@ namespace Laraue.Boards.Agent.Workspaces;
 /// are a folder holding a worktree per repository, all on the same branch (BRD-312). In checkouts (BRD-313): the clones
 /// themselves on the issue's branch, the agent starting in the first.
 /// </summary>
-sealed record Workspace(string Path, string Branch, IReadOnlyList<WorkspaceRepo> Repos, SpaceContext Space, bool InCheckouts)
+public sealed record Workspace(string Path, string Branch, IReadOnlyList<WorkspaceRepo> Repos, SpaceContext Space, bool InCheckouts)
 {
     public bool IsMultiRepo => Repos.Count > 1;
 
@@ -27,7 +27,7 @@ sealed record Workspace(string Path, string Branch, IReadOnlyList<WorkspaceRepo>
 /// counted against (in the worktree, HEAD is the run's own branch).
 /// </param>
 /// <param name="PreviousBranch">In checkout mode, the branch the clone was on before, to go back to when nothing was committed.</param>
-sealed record WorkspaceRepo(
+public sealed record WorkspaceRepo(
     string Name,
     string Path,
     string ClonePath,

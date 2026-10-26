@@ -9,7 +9,7 @@ namespace Laraue.Boards.Agent.Workspaces;
 /// a checkout mapped by hand in the config. Read from Boards at run time, so a link added there counts at the next
 /// hand-off without running setup again.
 /// </summary>
-sealed class SpaceResolver(BoardsClient boards, RunnerConfig config, CloneIndex clones)
+public sealed class SpaceResolver(IBoardsClient boards, RunnerConfig config, CloneIndex clones)
 {
     public async Task<SpaceContext> Resolve(string spaceKey, CancellationToken ct)
     {

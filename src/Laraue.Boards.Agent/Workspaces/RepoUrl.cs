@@ -4,7 +4,7 @@ namespace Laraue.Boards.Agent.Workspaces;
 /// A repository URL reduced to <c>host/owner/repo</c>, lower-case, without scheme, user, <c>.git</c> or trailing slash, so
 /// a git remote (<c>git@github.com:Laraue/x.git</c>) and a link (<c>https://github.com/Laraue/x</c>) compare equal.
 /// </summary>
-static class RepoUrl
+public static class RepoUrl
 {
     public static string? Normalize(string url)
     {

@@ -29,4 +29,4 @@ namespace Laraue.Boards.Agent.Boards;
 [JsonSerializable(typeof(bool))]
 [JsonSerializable(typeof(RunInProgress))]
 [JsonSerializable(typeof(AgentSession))]
-partial class RunnerJson : JsonSerializerContext;
+public partial class RunnerJson : JsonSerializerContext;

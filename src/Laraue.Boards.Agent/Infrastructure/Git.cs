@@ -2,7 +2,7 @@ using Laraue.Boards.Agent.Workspaces;
 
 namespace Laraue.Boards.Agent.Infrastructure;
 
-static class Git
+public static class Git
 {
     /// <summary>
     /// A worktree of <paramref name="repo"/> at <paramref name="path"/> on <paramref name="branch"/>. Reuses the worktree,

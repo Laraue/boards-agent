@@ -8,7 +8,7 @@ using Laraue.Boards.Agent.Workspaces;
 namespace Laraue.Boards.Agent.Commands;
 
 /// <summary>`lba`: polls Boards for the person's Ready runs and works on them one at a time, until stopped.</summary>
-static class RunCommand
+public static class RunCommand
 {
     public static async Task<int> RunAsync(RunnerArgs options, CancellationToken ct)
     {

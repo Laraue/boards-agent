@@ -11,7 +11,7 @@ namespace Laraue.Boards.Agent.Commands;
 /// maps spaces to local repositories, and makes sure the agent is signed in. Writes the config; running it again keeps
 /// what's there.
 /// </summary>
-static class Setup
+public static class Setup
 {
     public static async Task<int> RunAsync(RunnerArgs options, CancellationToken ct)
     {

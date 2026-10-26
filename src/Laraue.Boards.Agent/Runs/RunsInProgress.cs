@@ -9,10 +9,10 @@ namespace Laraue.Boards.Agent.Runs;
 /// <param name="Workspace">Null until the workspace exists.</param>
 /// <param name="SessionId">The agent's session, as soon as it said it - what a restarted runner resumes.</param>
 /// <param name="Resumes">How many times the run was already resumed after the runner stopped.</param>
-sealed record RunInProgress(long RunId, string IssueKey, RunInProgressWorkspace? Workspace, string? SessionId = null, int Resumes = 0);
+public sealed record RunInProgress(long RunId, string IssueKey, RunInProgressWorkspace? Workspace, string? SessionId = null, int Resumes = 0);
 
 /// <summary>What <see cref="WorkspaceManager.Finish"/> needs of a <see cref="Workspace"/>, to put it back after a crash.</summary>
-sealed record RunInProgressWorkspace(string Path, string Branch, bool InCheckouts, IReadOnlyList<WorkspaceRepo> Repos)
+public sealed record RunInProgressWorkspace(string Path, string Branch, bool InCheckouts, IReadOnlyList<WorkspaceRepo> Repos)
 {
     public static RunInProgressWorkspace Of(Workspace workspace)
     {
@@ -30,7 +30,7 @@ sealed record RunInProgressWorkspace(string Path, string Branch, bool InCheckout
 /// The run in progress, in a file next to the config (current-run.json): written when a run is claimed, removed when
 /// it ends. Still there when the runner starts means the last run was cut off (<see cref="Runner.RecoverInterruptedRun"/>).
 /// </summary>
-static class RunsInProgress
+public static class RunsInProgress
 {
     public static string PathFor(string configPath)
     {

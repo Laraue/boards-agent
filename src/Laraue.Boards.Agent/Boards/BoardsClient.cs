@@ -10,7 +10,7 @@ namespace Laraue.Boards.Agent.Boards;
 /// The Boards MCP tools the runner calls. A call that fails drops the connection and the next call opens a new one: an
 /// MCP session doesn't survive Boards restarting, and a broken one would fail every call after.
 /// </summary>
-sealed class BoardsClient(string url, string apiKey, McpClient connected) : IAsyncDisposable
+public sealed class BoardsClient(string url, string apiKey, McpClient connected) : IBoardsClient
 {
     private const int PageSize = 50;
 
@@ -45,14 +45,11 @@ sealed class BoardsClient(string url, string apiKey, McpClient connected) : IAsy
         return Call("list_spaces", new Dictionary<string, object?>(), RunnerJson.Default.IReadOnlyListSpaceSummary, ct);
     }
 
-    /// <summary>The user's own Ready runs in a space that aren't waiting for a blocker, oldest first.</summary>
-    /// <summary>A space's description and links (Boards' get_space).</summary>
     public Task<SpaceDetail> GetSpace(string spaceKey, CancellationToken ct)
     {
         return Call("get_space", new Dictionary<string, object?> { ["spaceKey"] = spaceKey }, RunnerJson.Default.SpaceDetail, ct);
     }
 
-    /// <summary>The user's own Ready runs that aren't waiting for a blocker - in one space, or every space when null.</summary>
     public async Task<IReadOnlyList<AgentRunSummary>> ListReadyRuns(string? spaceKey, Guid userId, CancellationToken ct)
     {
         var result = new List<AgentRunSummary>();
@@ -80,28 +77,21 @@ sealed class BoardsClient(string url, string apiKey, McpClient connected) : IAsy
         }
     }
 
-    /// <summary>False when the run was taken, cancelled or is blocked. Throws (403) when the issue isn't the user's.</summary>
     public Task<bool> ClaimAgentRun(long runId, CancellationToken ct)
     {
         return Call("claim_agent_run", new Dictionary<string, object?> { ["runId"] = runId }, RunnerJson.Default.Boolean, ct);
     }
 
-    /// <summary>
-    /// A new run of the issue that is already Working, claimed by this key - for `lba continue`. Throws (400) when the
-    /// issue already has an open run, (403) when the issue isn't the user's.
-    /// </summary>
     public Task<AgentRunSummary> StartAgentRun(string issueKey, CancellationToken ct)
     {
         return Call("start_agent_run", new Dictionary<string, object?> { ["issueKey"] = issueKey }, RunnerJson.Default.AgentRunSummary, ct);
     }
 
-    /// <summary>False when the run had already ended.</summary>
     public Task<bool> CancelAgentRun(long runId, CancellationToken ct)
     {
         return Call("cancel_agent_run", new Dictionary<string, object?> { ["runId"] = runId }, RunnerJson.Default.Boolean, ct);
     }
 
-    /// <summary>False when the run isn't Working anymore (cancelled meanwhile).</summary>
     public Task<bool> FinishAgentRun(long runId, string state, string? reason, CancellationToken ct)
     {
         return Call(
@@ -134,7 +124,6 @@ sealed class BoardsClient(string url, string apiKey, McpClient connected) : IAsy
         return CallVoid("create_comment", new Dictionary<string, object?> { ["issueKey"] = issueKey, ["text"] = text }, ct);
     }
 
-    /// <summary>The issue's comments after the first <paramref name="skip"/>, oldest first.</summary>
     public async Task<IReadOnlyList<IssueComment>> ListIssueCommentsFrom(string issueKey, int skip, CancellationToken ct)
     {
         var result = new List<IssueComment>();
@@ -206,4 +195,4 @@ sealed class BoardsClient(string url, string apiKey, McpClient connected) : IAsy
     }
 }
 
-sealed class BoardsToolException(string tool, string message) : Exception($"{tool}: {message}");
+public sealed class BoardsToolException(string tool, string message) : Exception($"{tool}: {message}");

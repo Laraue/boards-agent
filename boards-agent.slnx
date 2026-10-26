@@ -2,4 +2,7 @@
   <Folder Name="/src/">
     <Project Path="src/Laraue.Boards.Agent/Laraue.Boards.Agent.csproj" />
   </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Laraue.Boards.Agent.Tests/Laraue.Boards.Agent.Tests.csproj" />
+  </Folder>
 </Solution>

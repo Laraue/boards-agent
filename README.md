@@ -137,6 +137,8 @@ dotnet run --project src/Laraue.Boards.Agent
 
 The runner is `src/Laraue.Boards.Agent` (the work-on-issue skill in `plugin/` and the notification icon in `assets/` are embedded in it); `boards-agent.slnx` opens it in an IDE.
 
+The tests are in `tests/Laraue.Boards.Agent.Tests` (xunit, Moq) and need only git: `dotnet test`.
+
 Against a local Boards, point setup at it: `--web-url http://localhost:3000 --api-url http://localhost:5200 --mcp-url http://localhost:5202/mcp`.
 
 ## License

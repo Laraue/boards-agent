@@ -1,6 +1,6 @@
 namespace Laraue.Boards.Agent.Config;
 
-static class Paths
+public static class Paths
 {
     public static string Expand(string path)
     {

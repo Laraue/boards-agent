@@ -1,6 +1,6 @@
 namespace Laraue.Boards.Agent.Infrastructure;
 
-static class WindowsDialog
+public static class WindowsDialog
 {
     private const uint YesNo = 0x4;
     private const uint IconQuestion = 0x20;

@@ -8,7 +8,7 @@ namespace Laraue.Boards.Agent.Config;
 /// The runner's settings, written by `lba setup` to <see cref="DefaultPath"/>. The API key itself is never
 /// stored there - it's in the OS credential store (<see cref="CredentialStore"/>).
 /// </summary>
-sealed record RunnerConfig
+public sealed record RunnerConfig
 {
     // Settable, not init-only: the JSON source generator sets every missing init-only property to null/0, overriding
     // the defaults below, so a config written before a setting existed would get no value for it.

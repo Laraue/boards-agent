@@ -1,8 +1,8 @@
 namespace Laraue.Boards.Agent.Infrastructure;
 
-sealed record ProcessResult(int ExitCode, string Output, string Error);
+public sealed record ProcessResult(int ExitCode, string Output, string Error);
 
-static class Shell
+public static class Shell
 {
     /// <summary>Runs a process to the end, capturing its output; <paramref name="input"/> goes to its stdin.</summary>
     public static ProcessResult Run(System.Diagnostics.ProcessStartInfo info, string? input = null)

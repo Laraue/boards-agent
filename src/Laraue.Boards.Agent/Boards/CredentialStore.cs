@@ -7,7 +7,7 @@ namespace Laraue.Boards.Agent.Boards;
 /// the Windows Credential Manager.
 /// One entry per organization. The key never goes on a command line - it's passed on stdin - and never to a file.
 /// </summary>
-static class CredentialStore
+public static class CredentialStore
 {
     private const string Service = "boards-agent";
 

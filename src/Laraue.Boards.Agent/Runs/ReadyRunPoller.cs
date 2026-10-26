@@ -10,8 +10,8 @@ namespace Laraue.Boards.Agent.Runs;
 /// A run of a space with no repository cloned here is left for another machine; in checkout mode, one the person said
 /// "Not now" to is asked about again later.
 /// </summary>
-sealed class ReadyRunPoller(
-    BoardsClient boards,
+public sealed class ReadyRunPoller(
+    IBoardsClient boards,
     RunnerConfig config,
     SpaceResolver spaces,
     Runner runner,

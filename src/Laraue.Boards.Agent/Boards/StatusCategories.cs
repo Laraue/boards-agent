@@ -1,7 +1,7 @@
 namespace Laraue.Boards.Agent.Boards;
 
 /// <summary>Status category ids, as list_statuses returns them.</summary>
-static class StatusCategories
+public static class StatusCategories
 {
     public const int Created = 0;
     public const int InProgress = 1;

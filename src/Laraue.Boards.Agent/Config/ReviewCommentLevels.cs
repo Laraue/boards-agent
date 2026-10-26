@@ -1,7 +1,7 @@
 namespace Laraue.Boards.Agent.Config;
 
 /// <summary>Whose pull request review comments the agent gets on a re-run, see <see cref="RunnerConfig.ReviewComments"/>.</summary>
-static class ReviewCommentLevels
+public static class ReviewCommentLevels
 {
     /// <summary>None: the runner doesn't read pull requests.</summary>
     public const string Off = "off";

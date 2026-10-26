@@ -5,17 +5,17 @@ using Laraue.Boards.Agent.Config;
 
 namespace Laraue.Boards.Agent.Boards;
 
-sealed record AgentSignInStart(string DeviceCode, string UserCode, string VerificationPath, DateTime ExpiresAt, int IntervalSeconds);
+public sealed record AgentSignInStart(string DeviceCode, string UserCode, string VerificationPath, DateTime ExpiresAt, int IntervalSeconds);
 
-sealed record AgentSignInPoll(string Outcome, string? ApiKey, long? OrganizationId, string? OrganizationName, Guid? UserId);
+public sealed record AgentSignInPoll(string Outcome, string? ApiKey, long? OrganizationId, string? OrganizationName, Guid? UserId);
 
-sealed record SignedIn(string ApiKey, long OrganizationId, string OrganizationName);
+public sealed record SignedIn(string ApiKey, long OrganizationId, string OrganizationName);
 
 /// <summary>
 /// "Connect this machine": the runner asks Boards for a sign-in, the person allows it in the browser for one of their
 /// organizations, and the runner polls until Boards hands it the organization's new API key.
 /// </summary>
-static class BoardsSignIn
+public static class BoardsSignIn
 {
     /// <summary>Boards allows 37 characters of machine name, so the key name fits.</summary>
     private const int MaxMachineNameLength = 37;

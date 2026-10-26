@@ -7,7 +7,7 @@ namespace Laraue.Boards.Agent.Commands;
 /// Command-line options. <see cref="WebUrl"/>, <see cref="ApiUrl"/> and <see cref="McpUrl"/> point setup at another
 /// Boards than production, e.g. a local one.
 /// </summary>
-sealed record RunnerArgs(
+public sealed record RunnerArgs(
     string? Command,
     string ConfigPath,
     bool Once,

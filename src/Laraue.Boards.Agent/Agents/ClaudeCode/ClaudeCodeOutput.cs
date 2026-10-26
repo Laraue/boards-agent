@@ -7,7 +7,7 @@ namespace Laraue.Boards.Agent.Agents.ClaudeCode;
 /// Claude Code's stream-json output: every message carries the session id, an <c>assistant</c> message its tool calls,
 /// and the final <c>result</c> says how it ended, its turns and its cost.
 /// </summary>
-sealed class ClaudeCodeOutput : AgentOutput
+public sealed class ClaudeCodeOutput : AgentOutput
 {
     private const string BoardsToolPrefix = "mcp__boards__";
 

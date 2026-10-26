@@ -1,7 +1,7 @@
 namespace Laraue.Boards.Agent.Boards;
 
 /// <summary>A generic credential in the Windows Credential Manager, through advapi32's CredWrite/CredRead.</summary>
-static class WindowsCredentials
+public static class WindowsCredentials
 {
     private const int GenericType = 1;
 

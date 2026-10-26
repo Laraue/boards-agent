@@ -6,7 +6,7 @@ namespace Laraue.Boards.Agent.Agents;
 /// The work-on-issue skill, embedded in the runner and written out (again) on start: a Claude Code plugin folder, whose
 /// <c>skills/work-on-issue</c> Codex loads as a skill too.
 /// </summary>
-static class AgentPlugin
+public static class AgentPlugin
 {
     private const string Prefix = "plugin/";
 

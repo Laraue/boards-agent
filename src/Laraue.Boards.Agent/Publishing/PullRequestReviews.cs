@@ -9,10 +9,10 @@ namespace Laraue.Boards.Agent.Publishing;
 /// <summary>A pull request of the issue's branch with its open review comments.</summary>
 /// <param name="Level">Whose comments were kept, a <see cref="ReviewCommentLevels"/> value.</param>
 /// <param name="Skipped">Open comments left out because their authors aren't trusted at <paramref name="Level"/>.</param>
-sealed record PullRequestReview(string Url, IReadOnlyList<PullRequestReviewComment> Comments, string Level, int Skipped);
+public sealed record PullRequestReview(string Url, IReadOnlyList<PullRequestReviewComment> Comments, string Level, int Skipped);
 
 /// <param name="Where">The file and line of a line comment ("src/Api.cs:42"), or "review" / "comment" for the rest.</param>
-sealed record PullRequestReviewComment(string Where, string Author, string Body);
+public sealed record PullRequestReviewComment(string Where, string Author, string Body);
 
 /// <summary>
 /// The open review comments on the issue branch's pull requests, read with the GitHub CLI by the runner - the agent can't
@@ -23,7 +23,7 @@ sealed record PullRequestReviewComment(string Where, string Author, string Body)
 /// `lba review-comments`): on a public repository anyone can comment, and the agent edits code and runs builds and tests
 /// on this computer - a stranger's comment mustn't steer it.
 /// </summary>
-static class PullRequestReviews
+public static class PullRequestReviews
 {
     /// <summary>Caps what goes into the prompt; a longer comment is cut, and further comments are left out.</summary>
     private const int MaxCommentLength = 2000;

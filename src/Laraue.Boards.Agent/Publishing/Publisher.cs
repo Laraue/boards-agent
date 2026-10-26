@@ -7,7 +7,7 @@ using Laraue.Boards.Agent.Workspaces;
 namespace Laraue.Boards.Agent.Publishing;
 
 /// <summary>One repository's published work: a line for the issue comment, and the pull request, if one was opened.</summary>
-sealed record PublishedRepo(string Line, string? PullRequestUrl);
+public sealed record PublishedRepo(string Line, string? PullRequestUrl);
 
 /// <summary>
 /// After a Done run, publishes the agent's work as <see cref="RunnerConfig.Publish"/> says (BRD-315): pushes the issue's
@@ -15,7 +15,7 @@ sealed record PublishedRepo(string Line, string? PullRequestUrl);
 /// request with the GitHub CLI (or finds the one an earlier run opened). Done by the runner, never the agent. Failures
 /// are reported in the returned lines, not thrown: the run is done either way.
 /// </summary>
-static class Publisher
+public static class Publisher
 {
     public static IReadOnlyList<PublishedRepo> Publish(RunnerConfig config, AgentRunSummary run, Workspace workspace)
     {

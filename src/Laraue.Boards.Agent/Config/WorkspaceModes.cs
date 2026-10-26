@@ -1,7 +1,7 @@
 namespace Laraue.Boards.Agent.Config;
 
 /// <summary>Where the agent works, see <see cref="RunnerConfig.Workspace"/>.</summary>
-static class WorkspaceModes
+public static class WorkspaceModes
 {
     public const string Worktree = "worktree";
 

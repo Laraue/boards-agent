@@ -13,7 +13,7 @@ namespace Laraue.Boards.Agent.Agents.Codex;
 /// The work-on-issue skill is the same <c>SKILL.md</c> Claude Code uses. Codex has no turn or cost limit: the runner's
 /// timeout is the only one.
 /// </summary>
-sealed class CodexAgent(RunnerConfig config) : ICodingAgent
+public sealed class CodexAgent(RunnerConfig config) : ICodingAgent
 {
     public string Key => CodingAgents.Codex;
 

@@ -13,7 +13,7 @@ namespace Laraue.Boards.Agent.Commands;
 /// unattended round with the instruction - and afterwards posts one summary comment (and publishes, if set up); see
 /// <see cref="ContinueSession"/>.
 /// </summary>
-static class ContinueCommand
+public static class ContinueCommand
 {
     public static async Task<int> RunAsync(RunnerArgs options, CancellationToken ct)
     {

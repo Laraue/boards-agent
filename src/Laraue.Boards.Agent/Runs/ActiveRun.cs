@@ -9,7 +9,7 @@ namespace Laraue.Boards.Agent.Runs;
 /// the agent says it, so a restart or a crash can resume it - and, once the run ends, which branches got commits.
 /// </summary>
 /// <param name="runFilePath">Where the run in progress is recorded (<see cref="RunsInProgress"/>).</param>
-sealed class ActiveRun(
+public sealed class ActiveRun(
     AgentRunSummary run,
     Workspace workspace,
     string runFilePath,

@@ -13,7 +13,7 @@ namespace Laraue.Boards.Agent.Commands;
 /// the issue shows the agent working on it, then done. Boards being unreachable doesn't stop it: the session goes on
 /// without a run, and the summary is posted if Boards answers by then.
 /// </summary>
-sealed class ContinueSession : IAsyncDisposable
+public sealed class ContinueSession : IAsyncDisposable
 {
     private readonly RunnerConfig _config;
     private readonly string _runFile;

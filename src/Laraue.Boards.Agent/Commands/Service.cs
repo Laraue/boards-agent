@@ -9,7 +9,7 @@ namespace Laraue.Boards.Agent.Commands;
 /// Claude Code sign-in are - started at login and restarted if it stops. A launchd LaunchAgent on macOS, a Task Scheduler
 /// logon task on Windows. systemd isn't supported yet.
 /// </summary>
-static class Service
+public static class Service
 {
     private const string Label = "com.laraue.boards-agent";
 

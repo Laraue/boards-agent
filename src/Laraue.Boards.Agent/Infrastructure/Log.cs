@@ -1,6 +1,6 @@
 namespace Laraue.Boards.Agent.Infrastructure;
 
-static class Log
+public static class Log
 {
     private static StreamWriter? _file;
 

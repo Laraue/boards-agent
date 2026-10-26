@@ -6,7 +6,7 @@ namespace Laraue.Boards.Agent.Agents;
 /// What an agent says on stdout, one JSON event per line, read as it comes: its session, its steps, and at the end how it
 /// went (<see cref="Summary"/>) and its answer (<see cref="FinalMessage"/>). Each agent has its own format.
 /// </summary>
-abstract class AgentOutput
+public abstract class AgentOutput
 {
     /// <summary>The agent's session, which `lba continue` resumes; null until the agent said it.</summary>
     public string? SessionId { get; protected set; }

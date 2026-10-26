@@ -3,7 +3,7 @@ using System.Text.Json;
 namespace Laraue.Boards.Agent.Infrastructure;
 
 /// <summary>Reading optional values from JSON the runner doesn't own (agents' output, gh): missing or mistyped is null.</summary>
-static class JsonElementExtensions
+public static class JsonElementExtensions
 {
     public static JsonElement? Property(this JsonElement element, string name)
     {
