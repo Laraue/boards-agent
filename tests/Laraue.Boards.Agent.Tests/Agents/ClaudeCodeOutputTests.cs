@@ -57,7 +57,7 @@ public class ClaudeCodeOutputTests
     {
         _output.Read("""{"type":"result","subtype":"success","is_error":false,"num_turns":9,"total_cost_usd":2.4,"result":"All done."}""");
 
-        Assert.Equal("Claude Code: success, 9 turns, $2.40.", _output.Summary());
+        Assert.Equal("Claude Code: completed, 9 turns, $2.40.", _output.Summary());
         Assert.Equal("All done.", _output.FinalMessage());
         Assert.False(_output.HitTurnLimit);
     }
@@ -67,7 +67,27 @@ public class ClaudeCodeOutputTests
     {
         _output.Read("""{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":3,"total_cost_usd":0.1,"result":"API error"}""");
 
-        Assert.Equal("Claude Code: error_during_execution (error), 3 turns, $0.10. API error", _output.Summary());
+        Assert.Equal("Claude Code: failed (error during execution), 3 turns, $0.10. API error.", _output.Summary());
+    }
+
+    [Fact]
+    public void Summary_ShouldSayFailedAndHowToSignIn_WhenTheSignInExpired()
+    {
+        // Claude Code ends a failed sign-in with subtype "success" and is_error true.
+        _output.Read("""{"type":"result","subtype":"success","is_error":true,"num_turns":1,"total_cost_usd":0,"result":"Failed to authenticate: OAuth session expired and could not be refreshed"}""");
+
+        Assert.Equal(
+            "Claude Code: failed, 1 turn, $0.00. Failed to authenticate: OAuth session expired and could not be refreshed. "
+                + "To sign Claude Code in again, run `claude auth login` on this computer.",
+            _output.Summary());
+    }
+
+    [Fact]
+    public void Summary_ShouldSayOutOfTurns_WhenTheAgentRanOutOfTurns()
+    {
+        _output.Read("""{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":150,"total_cost_usd":5}""");
+
+        Assert.Equal("Claude Code: failed (out of turns), 150 turns, $5.00.", _output.Summary());
     }
 
     [Fact]

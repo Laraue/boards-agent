@@ -27,8 +27,49 @@ public sealed class ClaudeCodeOutput : AgentOutput
             return "No result from Claude Code.";
         }
 
-        var summary = $"Claude Code: {_subtype}{(_isError ? " (error)" : "")}, {_turns} turns, ${_cost:0.00}.";
-        return _isError && !string.IsNullOrEmpty(_resultText) ? $"{summary} {_resultText}" : summary;
+        var turns = _turns == 1 ? "1 turn" : $"{_turns} turns";
+        var summary = $"Claude Code: {Outcome()}, {turns}, ${_cost:0.00}.";
+        if (!Failed || string.IsNullOrEmpty(_resultText))
+        {
+            return summary;
+        }
+
+        summary = $"{summary} {_resultText.TrimEnd('.')}.";
+        return IsSignInError(_resultText) ? $"{summary} {SignInTip}" : summary;
+    }
+
+    /// <summary>What to do when Claude Code's sign-in expired: the runner's runs use the same sign-in.</summary>
+    public const string SignInTip = "To sign Claude Code in again, run `claude auth login` on this computer.";
+
+    /// <summary>
+    /// Claude Code's subtype alone can't say whether it failed: a failed sign-in ends with subtype "success" and
+    /// is_error true (BRD-375).
+    /// </summary>
+    private bool Failed => _isError || _subtype?.StartsWith("error", StringComparison.Ordinal) == true;
+
+    /// <summary>"completed", "failed", or "failed (out of turns)" for the error subtypes Claude Code documents.</summary>
+    private string Outcome()
+    {
+        if (!Failed)
+        {
+            return "completed";
+        }
+
+        return _subtype switch
+        {
+            "error_max_turns" => "failed (out of turns)",
+            "error_during_execution" => "failed (error during execution)",
+            "error_max_budget_usd" => "failed (out of budget)",
+            _ => "failed",
+        };
+    }
+
+    /// <summary>The errors that a new sign-in fixes, e.g. "Failed to authenticate: OAuth session expired..." or "Please run /login".</summary>
+    private static bool IsSignInError(string text)
+    {
+        return text.Contains("authenticate", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("OAuth", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("/login", StringComparison.Ordinal);
     }
 
     public override string? FinalMessage()
