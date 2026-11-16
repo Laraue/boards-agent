@@ -71,6 +71,64 @@ public class UpdaterTests : IDisposable
         }
     }
 
+    [Fact]
+    public void CheckRuns_ShouldPass_WhenTheNewBinarySaysItsVersion()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var executable = Script("echo 'laraue-boards-agent 0.5.0-beta.6'");
+
+        Updater.CheckRuns(executable, "v0.5.0-beta.6");
+    }
+
+    [Fact]
+    public void CheckRuns_ShouldRefuse_WhenTheNewBinaryFails()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var executable = Script("echo 'broken' >&2; exit 1");
+
+        var error = Assert.Throws<InvalidOperationException>(() => Updater.CheckRuns(executable, "v0.5.0-beta.6"));
+        Assert.Contains("exit code 1: broken", error.Message);
+    }
+
+    [Fact]
+    public void CheckRuns_ShouldRefuse_WhenTheNewBinaryIsAnotherVersion()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var executable = Script("echo 'laraue-boards-agent 0.5.0-beta.5'");
+
+        Assert.Throws<InvalidOperationException>(() => Updater.CheckRuns(executable, "v0.5.0-beta.6"));
+    }
+
+    [Fact]
+    public void CheckRuns_ShouldRefuse_WhenTheNewBinaryDoesntStart()
+    {
+        var executable = _directory.Combine("not-executable");
+        File.WriteAllText(executable, "not a program");
+
+        Assert.Throws<InvalidOperationException>(() => Updater.CheckRuns(executable, "v0.5.0-beta.6"));
+    }
+
+    /// <summary>A shell script standing in for the downloaded binary.</summary>
+    private string Script(string body)
+    {
+        var path = _directory.Combine("laraue-boards-agent");
+        File.WriteAllText(path, $"#!/bin/sh\n{body}\n");
+        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        return path;
+    }
+
     public void Dispose()
     {
         _directory.Dispose();
