@@ -80,6 +80,35 @@ public sealed class Updater(
     }
 
     /// <summary>
+    /// Runs <paramref name="newExecutable"/> with --version and throws unless it starts and says it's
+    /// <paramref name="tag"/>, so a binary that can't run never replaces one that can.
+    /// </summary>
+    /// <remarks>
+    /// Must come before <see cref="Install"/>: the running binary is a single file that loads an assembly from itself the
+    /// first time it's used. Once the file is replaced, an assembly not loaded yet can't be found - the restart after an
+    /// update failed on System.Diagnostics.Process that way. Starting a process here loads what starting the restart needs.
+    /// </remarks>
+    public static void CheckRuns(string newExecutable, string tag)
+    {
+        ProcessResult result;
+        try
+        {
+            result = Shell.Run(newExecutable, "--version");
+        }
+        catch (System.ComponentModel.Win32Exception e)
+        {
+            throw new InvalidOperationException($"The downloaded {tag} doesn't start ({e.Message}) - not installing it.", e);
+        }
+
+        if (result.ExitCode != 0 || !result.Output.Contains(tag.TrimStart('v'), StringComparison.Ordinal))
+        {
+            var said = (result.Output + result.Error).Trim();
+            throw new InvalidOperationException(
+                $"The downloaded {tag} didn't run as expected (exit code {result.ExitCode}{(said.Length == 0 ? "" : $": {said}")}) - not installing it.");
+        }
+    }
+
+    /// <summary>
     /// Puts <paramref name="newExecutable"/> in place of <paramref name="target"/>. The new file is copied next to it and
     /// renamed over it, so the target is never half written; a process running the old one keeps it until it restarts.
     /// On Windows the running executable can't be replaced, only renamed: it's moved aside first.

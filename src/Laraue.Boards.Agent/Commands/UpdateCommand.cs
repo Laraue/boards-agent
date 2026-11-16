@@ -28,12 +28,16 @@ public static class UpdateCommand
             return 0;
         }
 
+        // Everything after Install runs from a binary whose file is gone (see Updater.CheckRuns): decide about the service
+        // and check the new binary first, while the old file is still there to load from.
+        var restart = PlanRestart(options.ConfigPath, target);
         var runtime = Updater.CurrentRuntime();
         Console.WriteLine($"Downloading laraue-boards-agent {tag} ({runtime})...");
         var folder = Directory.CreateTempSubdirectory("laraue-boards-agent-update-").FullName;
         try
         {
             var executable = await updater.Download(tag, runtime, folder, ct);
+            Updater.CheckRuns(executable, tag);
             Updater.Install(executable, target);
         }
         finally
@@ -42,7 +46,13 @@ public static class UpdateCommand
         }
 
         Console.WriteLine($"Installed {tag} as {target}.");
-        RestartService(options.ConfigPath, target);
+        Console.WriteLine(restart.Message);
+        if (restart.Restart)
+        {
+            Service.Restart();
+            Console.WriteLine("The background service runs the new version.");
+        }
+
         return 0;
     }
 
@@ -50,27 +60,23 @@ public static class UpdateCommand
     /// The running service still has the old binary: it restarts on the new one, as after the install script - if it runs
     /// this binary, not another copy.
     /// </summary>
-    private static void RestartService(string configPath, string executable)
+    private static RestartPlan PlanRestart(string configPath, string executable)
     {
         if (!Service.IsSupported || !Service.IsInstalled)
         {
-            Console.WriteLine("Start the runner again (lba) to use the new version.");
-            return;
+            return new RestartPlan(false, "Start the runner again (lba) to use the new version.");
         }
 
         if (!Service.RegisteredFor(executable))
         {
-            Console.WriteLine("The background service runs another copy of laraue-boards-agent, so it isn't restarted. Update that copy with its own `lba update`.");
-            return;
+            return new RestartPlan(false, "The background service runs another copy of laraue-boards-agent, so it isn't restarted. Update that copy with its own `lba update`.");
         }
 
-        if (RunsInProgress.Load(RunsInProgress.PathFor(configPath)) is { } run)
-        {
-            Console.WriteLine($"{run.IssueKey}'s agent run is in progress: it resumes after the restart.");
-        }
-
-        Console.WriteLine("Restarting the background service...");
-        Service.Restart();
-        Console.WriteLine("The background service runs the new version.");
+        return RunsInProgress.Load(RunsInProgress.PathFor(configPath)) is { } run
+            ? new RestartPlan(true, $"{run.IssueKey}'s agent run is in progress: it resumes after the restart.\nRestarting the background service...")
+            : new RestartPlan(true, "Restarting the background service...");
     }
+
+    /// <summary>Whether to restart the service after the update, and what to tell the person.</summary>
+    private sealed record RestartPlan(bool Restart, string Message);
 }
